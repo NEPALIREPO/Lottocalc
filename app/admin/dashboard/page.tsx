@@ -62,7 +62,17 @@ export default async function AdminDashboardPage() {
       summary = await calculateDailySummary(today);
     } catch (error) {
       console.error('Error calculating daily summary:', error);
-      throw error;
+      // calculateDailySummary already returns default values on error, but if it throws, use defaults
+      const dateStr = today.toISOString().split('T')[0];
+      summary = {
+        date: dateStr,
+        scratchSales: 0,
+        onlineSales: 0,
+        grocerySales: 0,
+        lotteryCashes: 0,
+        playerBalance: 0,
+        expectedCash: 0,
+      };
     }
 
     try {
@@ -105,7 +115,8 @@ export default async function AdminDashboardPage() {
       boxes = await getBoxes();
     } catch (error) {
       console.error('Error getting boxes:', error);
-      throw error; // Boxes are critical, fail if can't load
+      // Return empty array instead of throwing to prevent complete page failure
+      boxes = [];
     }
 
     try {

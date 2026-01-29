@@ -46,18 +46,37 @@ export async function getPlayerBalance(playerId: string): Promise<number> {
 }
 
 export async function getPlayerBalances(): Promise<Array<{ playerId: string; name: string; balance: number }>> {
-  const supabase = await createClient();
-  const players = await getPlayers();
-  
-  const balances = await Promise.all(
-    players.map(async (player) => ({
-      playerId: player.id,
-      name: player.name,
-      balance: await getPlayerBalance(player.id),
-    }))
-  );
+  try {
+    const supabase = await createClient();
+    let players = [];
+    try {
+      players = await getPlayers();
+    } catch (error) {
+      console.error('Error getting players in getPlayerBalances:', error);
+      return [];
+    }
+    
+    const balances = await Promise.all(
+      players.map(async (player) => {
+        let balance = 0;
+        try {
+          balance = await getPlayerBalance(player.id);
+        } catch (error) {
+          console.error(`Error getting balance for player ${player.id}:`, error);
+        }
+        return {
+          playerId: player.id,
+          name: player.name,
+          balance,
+        };
+      })
+    );
 
-  return balances;
+    return balances;
+  } catch (error) {
+    console.error('Error in getPlayerBalances:', error);
+    return [];
+  }
 }
 
 export type PlayerTransactionType = 'play' | 'payment' | 'win';
@@ -118,52 +137,71 @@ export interface PlayerDailyActivity {
 }
 
 export async function getPlayerDailyActivities(date: string): Promise<PlayerDailyActivity[]> {
-  const supabase = await createClient();
-  
-  // Get all players
-  const players = await getPlayers();
-  
-  // Get all transactions for the date
-  const { data: transactions, error } = await supabase
-    .from('player_transactions')
-    .select('player_id, transaction_type, amount')
-    .eq('date', date);
+  try {
+    const supabase = await createClient();
+    
+    // Get all players
+    let players = [];
+    try {
+      players = await getPlayers();
+    } catch (error) {
+      console.error('Error getting players in getPlayerDailyActivities:', error);
+      return [];
+    }
+    
+    // Get all transactions for the date
+    const { data: transactions, error } = await supabase
+      .from('player_transactions')
+      .select('player_id, transaction_type, amount')
+      .eq('date', date);
 
-  if (error) throw error;
+    if (error) {
+      console.error('Error getting player transactions in getPlayerDailyActivities:', error);
+      return [];
+    }
 
-  // Calculate daily activity for each player
-  const activities: PlayerDailyActivity[] = await Promise.all(
-    players.map(async (player) => {
-      const playerTransactions = transactions?.filter(t => t.player_id === player.id) || [];
-      
-      let playedBalance = 0;
-      let winBalance = 0;
-      let paidBalance = 0;
+    // Calculate daily activity for each player
+    const activities: PlayerDailyActivity[] = await Promise.all(
+      players.map(async (player) => {
+        const playerTransactions = transactions?.filter(t => t.player_id === player.id) || [];
+        
+        let playedBalance = 0;
+        let winBalance = 0;
+        let paidBalance = 0;
 
-      playerTransactions.forEach((txn) => {
-        const amt = txn.amount ?? 0;
-        if (txn.transaction_type === 'play') {
-          playedBalance += amt;
-        } else if (txn.transaction_type === 'win') {
-          winBalance += amt;
-        } else if (txn.transaction_type === 'payment') {
-          paidBalance += amt;
+        playerTransactions.forEach((txn) => {
+          const amt = txn.amount ?? 0;
+          if (txn.transaction_type === 'play') {
+            playedBalance += amt;
+          } else if (txn.transaction_type === 'win') {
+            winBalance += amt;
+          } else if (txn.transaction_type === 'payment') {
+            paidBalance += amt;
+          }
+        });
+
+        // Get total balance (all-time) - handle errors gracefully
+        let totalBalanceDue = 0;
+        try {
+          totalBalanceDue = await getPlayerBalance(player.id);
+        } catch (error) {
+          console.error(`Error getting balance for player ${player.id}:`, error);
         }
-      });
 
-      // Get total balance (all-time)
-      const totalBalanceDue = await getPlayerBalance(player.id);
+        return {
+          playerId: player.id,
+          name: player.name,
+          playedBalance,
+          winBalance,
+          paidBalance,
+          totalBalanceDue,
+        };
+      })
+    );
 
-      return {
-        playerId: player.id,
-        name: player.name,
-        playedBalance,
-        winBalance,
-        paidBalance,
-        totalBalanceDue,
-      };
-    })
-  );
-
-  return activities;
+    return activities;
+  } catch (error) {
+    console.error('Error in getPlayerDailyActivities:', error);
+    return [];
+  }
 }
