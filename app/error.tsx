@@ -19,6 +19,9 @@ export default function Error({
   const code = (error as any)?.code ?? error?.digest;
   const details = (error as any)?.details;
   const hint = (error as any)?.hint;
+  
+  // Check if this is a Server Components render error (common when env vars missing)
+  const isServerRenderError = code === '2704750074' || error?.digest === '2704750074';
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
@@ -29,6 +32,12 @@ export default function Error({
             {code === '42P17' && (
               <span className="block mt-2 text-amber-600">
                 PostgreSQL 42P17 = invalid object definition. Often caused by trigger/rule syntax or schema mismatch.
+              </span>
+            )}
+            {isServerRenderError && (
+              <span className="block mt-2 text-amber-600">
+                Server Components render error. This often occurs when Supabase environment variables are missing.
+                Check that NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY are set in your deployment.
               </span>
             )}
           </CardDescription>
@@ -52,6 +61,17 @@ export default function Error({
             <div className="text-sm">
               <span className="font-medium">Hint:</span>
               <pre className="mt-1 rounded bg-muted p-2 text-xs overflow-auto">{hint}</pre>
+            </div>
+          )}
+          {isServerRenderError && (
+            <div className="rounded-md bg-amber-50 border border-amber-200 p-4 text-sm">
+              <p className="font-medium text-amber-900 mb-2">Troubleshooting Steps:</p>
+              <ol className="list-decimal list-inside space-y-1 text-amber-800">
+                <li>Verify environment variables are set in Vercel (Settings → Environment Variables)</li>
+                <li>Ensure NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY are configured</li>
+                <li>Redeploy your application after adding environment variables</li>
+                <li>Check Vercel build logs for any environment variable errors</li>
+              </ol>
             </div>
           )}
           <div className="flex gap-2 pt-2">
