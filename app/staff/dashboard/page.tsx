@@ -5,6 +5,10 @@ import { getDailyBoxEntries } from '@/lib/actions/daily-entries';
 import { getActivatedBooksForDate } from '@/lib/actions/activated-books';
 import StaffDashboardClient from './client';
 
+type BoxesResult = Awaited<ReturnType<typeof getBoxes>>;
+type EntriesResult = Awaited<ReturnType<typeof getDailyBoxEntries>>;
+type ActivatedBooksResult = Awaited<ReturnType<typeof getActivatedBooksForDate>>;
+
 export default async function StaffDashboardPage() {
   try {
     const supabase = await createClient();
@@ -20,10 +24,10 @@ export default async function StaffDashboardPage() {
     }
 
     const today = new Date().toISOString().split('T')[0];
-    
-    let boxes = [];
-    let entries = [];
-    let activatedBooksForToday = [];
+
+    let boxes: BoxesResult = [];
+    let entries: EntriesResult = [];
+    let activatedBooksForToday: ActivatedBooksResult = [];
 
     try {
       boxes = await getBoxes();
