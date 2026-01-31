@@ -95,7 +95,7 @@ Lottocalc/
 ## Data Flow
 
 1. **Staff Entry Flow:**
-   - Staff enters box numbers → `upsertDailyBoxEntry`
+   - Staff enters box numbers → `saveAllDailyBoxEntries` / `saveOpenNumbers` / `saveCloseNumbers`
    - Trigger checks continuity → `ticket_continuity_logs`
    - Staff uploads receipts → OCR extraction → Save reports
 

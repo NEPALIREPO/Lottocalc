@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "NODE_OPTIONS='--disable-warning=ExperimentalWarning' next dev",
+    "build": "NODE_OPTIONS='--disable-warning=ExperimentalWarning' next build",
     "start": "next start",
     "lint": "next lint"
   },
@@ -16,8 +16,10 @@
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.0",
     "date-fns": "^3.0.0",
+    "exceljs": "^4.4.0",
     "lucide-react": "^0.344.0",
     "next": "^16.1.6",
+    "pdfjs-dist": "^5.4.530",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-hook-form": "^7.49.2",

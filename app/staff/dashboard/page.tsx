@@ -3,11 +3,14 @@ import { createClient } from '@/lib/supabase/server';
 import { getBoxes } from '@/lib/actions/boxes';
 import { getDailyBoxEntries } from '@/lib/actions/daily-entries';
 import { getActivatedBooksForDate } from '@/lib/actions/activated-books';
+import type { Entry } from '@/lib/types/dashboard';
 import StaffDashboardClient from './client';
 
 type BoxesResult = Awaited<ReturnType<typeof getBoxes>>;
 type EntriesResult = Awaited<ReturnType<typeof getDailyBoxEntries>>;
 type ActivatedBooksResult = Awaited<ReturnType<typeof getActivatedBooksForDate>>;
+
+export const dynamic = 'force-dynamic';
 
 export default async function StaffDashboardPage() {
   try {
@@ -50,11 +53,18 @@ export default async function StaffDashboardPage() {
       activatedBooksForToday = [];
     }
 
+    // Ensure props are serializable for Server Component → Client (no Date/undefined)
+    const serialized = {
+      boxes: JSON.parse(JSON.stringify(boxes ?? [])),
+      entries: JSON.parse(JSON.stringify(entries ?? [])) as Entry[],
+      activatedBooksForDate: JSON.parse(JSON.stringify(activatedBooksForToday ?? [])),
+    };
+
     return (
       <StaffDashboardClient
-        boxes={boxes}
-        entries={entries}
-        activatedBooksForDate={activatedBooksForToday}
+        boxes={serialized.boxes}
+        entries={serialized.entries}
+        activatedBooksForDate={serialized.activatedBooksForDate}
       />
     );
   } catch (error) {

@@ -39,32 +39,39 @@ export default function LoginPage() {
       return;
     }
 
-    try {
+    const LOGIN_TIMEOUT_MS = 20_000;
+
+    const loginTask = (async () => {
       const { data, error } = await supabase.auth.signInWithPassword({
         email,
         password,
       });
-
       if (error) throw error;
-
-      if (data.user) {
-        // Fetch role from public.users table
-        const { data: userData } = await supabase
-          .from('users')
-          .select('role')
-          .eq('id', data.user.id)
-          .single();
-        
-        const role = userData?.role;
-        if (role === 'ADMIN') {
-          router.push('/admin/dashboard');
-        } else {
-          router.push('/staff/dashboard');
-        }
-        router.refresh();
+      if (!data.user) throw new Error('No user returned');
+      const { data: userData, error: roleError } = await supabase
+        .from('users')
+        .select('role')
+        .eq('id', data.user.id)
+        .single();
+      if (roleError) throw new Error(roleError.message || 'Could not load your role.');
+      const role = userData?.role;
+      if (role === 'ADMIN') {
+        router.push('/admin/dashboard');
+      } else {
+        router.push('/staff/dashboard');
       }
-    } catch (err: any) {
-      setError(err.message || 'Failed to login');
+      router.refresh();
+    })();
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Login timed out. Check your connection and try again.')), LOGIN_TIMEOUT_MS)
+    );
+
+    try {
+      await Promise.race([loginTask, timeoutPromise]);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to login';
+      setError(message);
     } finally {
       setLoading(false);
     }

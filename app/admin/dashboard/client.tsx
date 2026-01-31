@@ -1,26 +1,34 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { getContinuityLogs } from '@/lib/actions/continuity';
 import { getWeeklySummary, getDateRangeSummary } from '@/lib/actions/calculations';
+import type { DailySummary } from '@/lib/calculations';
 import { getBoxes, createBox, updateBox, deleteBox } from '@/lib/actions/boxes';
-import { getDailyBoxEntries, saveAllDailyBoxEntries, getDailyEntrySubmission } from '@/lib/actions/daily-entries';
-import { getActivatedBooks, getActivatedBooksForDate, createActivatedBook } from '@/lib/actions/activated-books';
-import { createLotteryReport, getAllLotteryReports } from '@/lib/actions/lottery-reports';
+import { getDailyBoxEntries, saveAllDailyBoxEntries, saveOpenNumbers, saveCloseNumbers, getDailyEntrySubmission, markDailyEntriesSubmitted } from '@/lib/actions/daily-entries';
+import { getActivatedBooks, getActivatedBooksForDate, createActivatedBook, updateActivatedBook, deleteActivatedBook } from '@/lib/actions/activated-books';
+import { createLotteryReport, getLotteryReports, getAllLotteryReports } from '@/lib/actions/lottery-reports';
 import { createPOSReport, getAllPOSReports } from '@/lib/actions/pos-reports';
+import { getDailyReportGeneratedFields, type DailyReportGeneratedFields } from '@/lib/actions/daily-report';
+import { upsertDailyCashRegister } from '@/lib/actions/daily-cash-register';
 import { getPlayers, createPlayer, createPlayerTransaction, getPlayerBalance, getPlayerTransactions, type PlayerDailyActivity } from '@/lib/actions/players';
 import { uploadFileClient } from '@/lib/actions/storage';
-import { processLotteryReportImage, processPOSReportImage } from '@/lib/ocr';
+import { processLotteryReportImage, processPOSReportImage, parsePOSReport } from '@/lib/ocr';
+import { parseCSVForPOS, parseExcelForPOS, isPOSSpreadsheetFile } from '@/lib/parse-pos-file';
+import { extractTextFromPDF, isPDFFile } from '@/lib/parse-pdf';
 import { formatCurrency, formatDate } from '@/lib/utils';
+import { parseOpenClose, openDisplay, closeDisplay } from '@/lib/utils/entries';
+import { mapLotteryReportsToForms } from '@/lib/utils/lottery-forms';
+import type { Box, Entry, Player, ActivatedBookForDate } from '@/lib/types/dashboard';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Ticket, LogOut, FileText, BarChart3 } from 'lucide-react';
+import { Ticket, LogOut, FileText, BarChart3, DollarSign, TrendingUp, AlertCircle, Box as BoxIcon } from 'lucide-react';
 import {
   LineChart,
   Line,
@@ -32,17 +40,11 @@ import {
   Tooltip,
   Legend,
   ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
 } from 'recharts';
-
-interface DailySummary {
-  date: string;
-  scratchSales: number;
-  onlineSales: number;
-  grocerySales: number;
-  lotteryCashes: number;
-  playerBalance: number;
-  expectedCash: number;
-}
+import { KPICard } from '@/components/admin/KPICard';
 
 interface ContinuityLog {
   id: string;
@@ -63,43 +65,99 @@ interface PlayerBalance {
   balance: number;
 }
 
-interface Box {
-  id: string;
-  box_number: number | null;
-  name: string;
-  ticket_value: number;
-  category: string;
-}
-
-interface Entry {
-  id: string;
-  date: string;
-  box_id: string;
-  open_number: number;
-  close_number: number | null;
-  new_box_start_number: number | null;
-  activated_book_id: string | null;
-  sold_count: number;
-  sold_amount: number;
-  boxes: Box;
-  activated_books?: { id: string; start_ticket_number: number; activated_date: string; ticket_count: number; note: string | null } | null;
-}
-
-interface ActivatedBookForDate {
-  id: string;
-  box_id: string;
-  start_ticket_number: number;
-  activated_date: string;
-  ticket_count: number;
-  note: string | null;
-}
-
-interface Player {
-  id: string;
-  name: string;
-}
-
 const PREDEFINED_TICKET_VALUES = [1, 2, 5, 10, 20, 25, 30, 50];
+
+function ReportFieldRow({ label, value }: { label: string; value: number }) {
+  return (
+    <tr className="border-b border-border/50">
+      <td className="p-3 text-muted-foreground align-top w-2/5">{label}</td>
+      <td className="p-3 font-semibold tabular-nums">{formatCurrency(value)}</td>
+    </tr>
+  );
+}
+
+function ReportFieldRowEditable({
+  label,
+  value,
+  onSave,
+  disabled,
+}: {
+  label: string;
+  value: number | null;
+  onSave: (value: number | null) => void;
+  disabled: boolean;
+}) {
+  const [edit, setEdit] = useState<string>(value != null ? String(value) : '');
+  useEffect(() => {
+    setEdit(value != null ? String(value) : '');
+  }, [value]);
+  const num = edit.trim() === '' ? null : parseFloat(edit);
+  const valid = edit.trim() === '' || !Number.isNaN(num);
+  return (
+    <tr className="border-b border-border/50">
+      <td className="p-3 text-muted-foreground align-top w-2/5">{label}</td>
+      <td className="p-3 flex flex-wrap items-center gap-2">
+        <Input
+          type="number"
+          inputMode="decimal"
+          className="w-32 h-9"
+          value={edit}
+          onChange={(e) => setEdit(e.target.value)}
+          placeholder="Enter amount"
+          disabled={disabled}
+        />
+        <Button size="sm" onClick={() => onSave(valid ? num : null)} disabled={disabled || !valid}>
+          {disabled ? 'Saving…' : 'Save'}
+        </Button>
+        {value != null && (
+          <span className="text-muted-foreground text-xs">Current: {formatCurrency(value)}</span>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+function ReportFieldRowEditableList({
+  label,
+  value,
+  onSave,
+  disabled,
+}: {
+  label: string;
+  value: number | null;
+  onSave: (value: number | null) => void;
+  disabled: boolean;
+}) {
+  const [edit, setEdit] = useState<string>(value != null ? String(value) : '');
+  useEffect(() => {
+    setEdit(value != null ? String(value) : '');
+  }, [value]);
+  const num = edit.trim() === '' ? null : parseFloat(edit);
+  const valid = edit.trim() === '' || !Number.isNaN(num);
+  return (
+    <div className="flex items-center justify-between py-3 px-4 rounded-lg bg-gray-50 flex-wrap gap-2">
+      <div className="flex items-center gap-2">
+        <span className="text-sm text-gray-700">{label}</span>
+        <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">Editable</span>
+      </div>
+      <div className="flex items-center gap-2">
+        <Input
+          type="number"
+          inputMode="decimal"
+          className="w-32 h-9"
+          value={edit}
+          onChange={(e) => setEdit(e.target.value)}
+          placeholder="Enter amount"
+          disabled={disabled}
+        />
+        <Button size="sm" onClick={() => onSave(valid ? num : null)} disabled={disabled || !valid}>
+          {disabled ? 'Saving…' : 'Save'}
+        </Button>
+        {value != null && <span className="text-xs text-gray-500">Current: {formatCurrency(value)}</span>}
+      </div>
+    </div>
+  );
+}
 
 export default function AdminDashboardClient({
   summary: initialSummary,
@@ -147,15 +205,41 @@ export default function AdminDashboardClient({
   const [players, setPlayers] = useState<Player[]>(initialPlayers);
   const [activatedBooksList, setActivatedBooksList] = useState<any[]>([]);
   const [activatedBooksForToday, setActivatedBooksForToday] = useState<ActivatedBookForDate[]>(activatedBooksForDate);
+  const [editingActivatedBook, setEditingActivatedBook] = useState<{
+    id: string;
+    box_id: string;
+    activated_date: string;
+    start_ticket_number: number;
+    ticket_count: number;
+    note: string | null;
+  } | null>(null);
   const [loadingEntryDate, setLoadingEntryDate] = useState(false);
   
   const [loading, setLoading] = useState(false);
+  const [loadingOpen, setLoadingOpen] = useState(false);
+  const [loadingClose, setLoadingClose] = useState(false);
   const [activeSection, setActiveSection] = useState<'entry' | 'reports'>('entry');
   const [entryTab, setEntryTab] = useState<'boxes' | 'activatedBooks' | 'reports' | 'players'>('boxes');
   const [reportsTab, setReportsTab] = useState<'overview' | 'mismatches' | 'players' | 'weekly' | 'boxManagement' | 'receipts'>('overview');
+  const [reportDate, setReportDate] = useState(today);
+  const [dailyReportFields, setDailyReportFields] = useState<DailyReportGeneratedFields | null>(null);
+  const [loadingReportFields, setLoadingReportFields] = useState(false);
+  const [savingRegister, setSavingRegister] = useState(false);
   const [lotteryReportsList, setLotteryReportsList] = useState<any[]>([]);
   const [posReportsList, setPosReportsList] = useState<any[]>([]);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [reportEntryDate, setReportEntryDate] = useState(today);
+  const [instant34Form, setInstant34Form] = useState<{ totalCashes: string }>({ totalCashes: '' });
+  const [special50Form, setSpecial50Form] = useState<{
+    totalSales: string; seasonTkts: string; discount: string; cancels: string; freeBets: string;
+    commission: string; cashes: string; cashBonus: string; claimBonus: string; adjustments: string; serviceFee: string;
+  }>({
+    totalSales: '', seasonTkts: '', discount: '', cancels: '', freeBets: '',
+    commission: '', cashes: '', cashBonus: '', claimBonus: '', adjustments: '', serviceFee: '',
+  });
+  const [loadingReportForms, setLoadingReportForms] = useState(false);
+  const [savingReport34, setSavingReport34] = useState(false);
+  const [savingReport50, setSavingReport50] = useState(false);
   const [editingBox, setEditingBox] = useState<Box | null>(null);
   const [boxForm, setBoxForm] = useState({
     name: '',
@@ -213,6 +297,57 @@ export default function AdminDashboardClient({
       console.error('Failed to load receipts:', error);
     }
   };
+
+  const loadReportFormsForDate = async (date: string) => {
+    setLoadingReportForms(true);
+    try {
+      const reports = await getLotteryReports(date);
+      const { instant34Form: i34, special50Form: s50 } = mapLotteryReportsToForms(reports ?? null);
+      setInstant34Form(i34);
+      setSpecial50Form(s50);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoadingReportForms(false);
+    }
+  };
+
+  useEffect(() => {
+    if (reportEntryDate) loadReportFormsForDate(reportEntryDate);
+  }, [reportEntryDate]);
+
+  const loadDailyReportFields = async (date: string) => {
+    setLoadingReportFields(true);
+    try {
+      const fields = await getDailyReportGeneratedFields(date);
+      setDailyReportFields(fields);
+    } catch (e) {
+      console.error('Failed to load daily report fields:', e);
+      setDailyReportFields(null);
+    } finally {
+      setLoadingReportFields(false);
+    }
+  };
+
+  const handleSaveCashRegister = async (
+    date: string,
+    lotteryCashAtRegister: number | null,
+    groceryCashAtRegister: number | null
+  ) => {
+    setSavingRegister(true);
+    try {
+      await upsertDailyCashRegister(date, { lotteryCashAtRegister, groceryCashAtRegister });
+      await loadDailyReportFields(date);
+    } catch (e: any) {
+      alert(e?.message || 'Failed to save');
+    } finally {
+      setSavingRegister(false);
+    }
+  };
+
+  useEffect(() => {
+    if (reportsTab === 'overview') loadDailyReportFields(reportDate);
+  }, [reportsTab, reportDate]);
 
   const loadContinuityLogs = async () => {
     try {
@@ -400,9 +535,9 @@ export default function AdminDashboardClient({
 
   // Entry handlers (admin can always edit; Sold/Amount calculated after submit via refetch)
   const handleSaveAllBoxEntries = async (
-    updates: Array<{ 
-      boxId: string; 
-      openNumber: number; 
+    updates: Array<{
+      boxId: string;
+      openNumber: number | null;
       closeNumber: number | null;
       newBoxStartNumber?: number | null;
       activatedBookId?: string | null;
@@ -421,6 +556,109 @@ export default function AdminDashboardClient({
       alert(error.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleSaveOpenNumbers = async (
+    updates: Array<{ boxId: string; openNumber: number | null; newBoxStartNumber?: number | null; activatedBookId?: string | null }>
+  ) => {
+    if (updates.length === 0) {
+      alert('Enter at least one open number.');
+      return;
+    }
+    setLoadingOpen(true);
+    try {
+      await saveOpenNumbers(entryDate, updates);
+      const newEntries = await getDailyBoxEntries(entryDate);
+      setEntries(Object.fromEntries(newEntries.map((e) => [e.box_id, e])));
+    } catch (error: any) {
+      alert(error.message);
+    } finally {
+      setLoadingOpen(false);
+    }
+  };
+
+  const handleSaveCloseNumbers = async (
+    updates: Array<{ boxId: string; closeNumber: number | null }>
+  ) => {
+    if (updates.length === 0) {
+      alert('Enter at least one close number.');
+      return;
+    }
+    setLoadingClose(true);
+    try {
+      await saveCloseNumbers(entryDate, updates);
+      const newEntries = await getDailyBoxEntries(entryDate);
+      setEntries(Object.fromEntries(newEntries.map((e) => [e.box_id, e])));
+    } catch (error: any) {
+      alert(error.message);
+    } finally {
+      setLoadingClose(false);
+    }
+  };
+
+  const handleSubmitDay = async () => {
+    setLoading(true);
+    try {
+      await markDailyEntriesSubmitted(entryDate);
+      setEntrySubmission({ date: entryDate, submitted_at: new Date().toISOString() });
+    } catch (error: any) {
+      alert(error.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSaveReport34 = async () => {
+    const totalCashes = instant34Form.totalCashes.trim() ? parseFloat(instant34Form.totalCashes) : undefined;
+    if (totalCashes == null || isNaN(totalCashes)) {
+      alert('Enter Total cashes');
+      return;
+    }
+    setSavingReport34(true);
+    try {
+      await createLotteryReport(reportEntryDate, 'instant_34', { instantTotal: totalCashes });
+      await loadReportFormsForDate(reportEntryDate);
+      await loadReceipts();
+      alert('Instant Report 34 saved.');
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : 'Failed to save');
+    } finally {
+      setSavingReport34(false);
+    }
+  };
+
+  const handleSaveReport50 = async () => {
+    const totalSales = special50Form.totalSales.trim() ? parseFloat(special50Form.totalSales) : 0;
+    const discount = special50Form.discount.trim() ? parseFloat(special50Form.discount) : 0;
+    const cancels = special50Form.cancels.trim() ? parseFloat(special50Form.cancels) : 0;
+    const freeBets = special50Form.freeBets.trim() ? parseFloat(special50Form.freeBets) : 0;
+    const commission = special50Form.commission.trim() ? parseFloat(special50Form.commission) : 0;
+    const cashes = special50Form.cashes.trim() ? parseFloat(special50Form.cashes) : 0;
+    const cashBonus = special50Form.cashBonus.trim() ? parseFloat(special50Form.cashBonus) : 0;
+    const serviceFee = special50Form.serviceFee.trim() ? parseFloat(special50Form.serviceFee) : 0;
+    setSavingReport50(true);
+    try {
+      await createLotteryReport(reportEntryDate, 'special_50', {
+        totalSales: totalSales || undefined,
+        seasonTkts: special50Form.seasonTkts.trim() ? parseFloat(special50Form.seasonTkts) : undefined,
+        discount: discount || undefined,
+        cancels: cancels || undefined,
+        freeBets: freeBets || undefined,
+        commission: commission || undefined,
+        cashValue: cashes || undefined,
+        cashBonus: cashBonus || undefined,
+        claimsBonus: special50Form.claimBonus.trim() ? parseFloat(special50Form.claimBonus) : undefined,
+        adjustments: special50Form.adjustments.trim() ? parseFloat(special50Form.adjustments) : undefined,
+        serviceFee: serviceFee || undefined,
+      });
+      await loadReportFormsForDate(reportEntryDate);
+      await loadReceipts();
+      alert('Special Report 50 saved.');
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : 'Failed to save');
+    } finally {
+      setSavingReport50(false);
     }
   };
 
@@ -470,12 +708,13 @@ export default function AdminDashboardClient({
   const handlePOSReport = async (file: File, ocrData: any) => {
     setLoading(true);
     try {
-      const imageUrl = await uploadFileClient(supabase, file, 'pos');
-      
+      const isImage = file.type.startsWith('image/');
+      const imageUrl = isImage ? await uploadFileClient(supabase, file, 'pos') : undefined;
+
       await createPOSReport(today, {
-        groceryTotal: ocrData.totalSales || 0,
-        cash: ocrData.cash || 0,
-        card: ocrData.card || 0,
+        groceryTotal: ocrData.totalSales ?? 0,
+        cash: ocrData.cash ?? 0,
+        card: ocrData.card ?? 0,
         rawImageUrl: imageUrl,
       });
       await loadReceipts(); // Refresh receipts list
@@ -636,7 +875,12 @@ export default function AdminDashboardClient({
                     today={entryDate}
                     activatedBooksForDate={activatedBooksForToday}
                     onSaveAll={handleSaveAllBoxEntries}
+                    onSaveOpenNumbers={handleSaveOpenNumbers}
+                    onSaveCloseNumbers={handleSaveCloseNumbers}
+                    onSubmitDay={handleSubmitDay}
                     loading={loading}
+                    loadingOpen={loadingOpen}
+                    loadingClose={loadingClose}
                     isAdmin={true}
                     isSubmitted={!!entrySubmission}
                   />
@@ -667,6 +911,36 @@ export default function AdminDashboardClient({
                 <CardDescription>Recent activated books (new ticket rolls).</CardDescription>
               </CardHeader>
               <CardContent>
+                {editingActivatedBook && (
+                  <Card className="mb-4 border-primary/50">
+                    <CardHeader>
+                      <CardTitle>Edit activated book</CardTitle>
+                      <CardDescription>Update fields and save, or cancel to close.</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <ActivatedBookEditForm
+                        key={editingActivatedBook.id}
+                        boxes={boxes}
+                        initial={editingActivatedBook}
+                        onSave={async (updates) => {
+                          try {
+                            await updateActivatedBook(editingActivatedBook.id, updates);
+                            await loadActivatedBooks();
+                            if (editingActivatedBook.activated_date === entryDate) {
+                              const forDate = await getActivatedBooksForDate(entryDate);
+                              setActivatedBooksForToday(forDate);
+                            }
+                            setEditingActivatedBook(null);
+                          } catch (e) {
+                            alert(e instanceof Error ? e.message : 'Failed to update');
+                          }
+                        }}
+                        onCancel={() => setEditingActivatedBook(null)}
+                        loading={loading}
+                      />
+                    </CardContent>
+                  </Card>
+                )}
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -676,12 +950,13 @@ export default function AdminDashboardClient({
                       <TableHead>Count</TableHead>
                       <TableHead>End #</TableHead>
                       <TableHead>Note</TableHead>
+                      <TableHead className="w-24">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {activatedBooksList.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={6} className="text-muted-foreground text-center py-8">
+                        <TableCell colSpan={7} className="text-muted-foreground text-center py-8">
                           No activated books yet. Add one above.
                         </TableCell>
                       </TableRow>
@@ -699,6 +974,48 @@ export default function AdminDashboardClient({
                             <TableCell className="tabular-nums">{row.ticket_count}</TableCell>
                             <TableCell className="tabular-nums text-muted-foreground">{endNum}</TableCell>
                             <TableCell className="text-muted-foreground">{row.note ?? '—'}</TableCell>
+                            <TableCell>
+                              <div className="flex items-center gap-1">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() =>
+                                    setEditingActivatedBook({
+                                      id: row.id,
+                                      box_id: row.box_id,
+                                      activated_date: row.activated_date,
+                                      start_ticket_number: row.start_ticket_number,
+                                      ticket_count: row.ticket_count,
+                                      note: row.note ?? null,
+                                    })
+                                  }
+                                >
+                                  Edit
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="text-destructive hover:text-destructive"
+                                  onClick={async () => {
+                                    if (!confirm('Delete this activated book? Daily entries linked to it will be unlinked.')) return;
+                                    try {
+                                      await deleteActivatedBook(row.id);
+                                      await loadActivatedBooks();
+                                      if (row.activated_date === entryDate) {
+                                        const forDate = await getActivatedBooksForDate(entryDate);
+                                        setActivatedBooksForToday(forDate);
+                                      }
+                                    } catch (e) {
+                                      alert(e instanceof Error ? e.message : 'Failed to delete');
+                                    }
+                                  }}
+                                >
+                                  Delete
+                                </Button>
+                              </div>
+                            </TableCell>
                           </TableRow>
                         );
                       })
@@ -731,6 +1048,236 @@ export default function AdminDashboardClient({
                   onUpload={(file, ocrData) => handleLotteryReport('special_50', file, ocrData)}
                   disabled={loading}
                 />
+
+                <div className="border-t pt-4 mt-4">
+                  <h3 className="text-sm font-semibold mb-3">Manual entry</h3>
+                  <p className="text-sm text-muted-foreground mb-4">
+                    Enter report values manually or edit after upload. Select date and fill the fields. Calculated fields (Net Sales, Net Due) update automatically.
+                  </p>
+                  <div className="flex flex-wrap items-end gap-4 mb-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="admin-report-entry-date">Report date</Label>
+                      <Input
+                        id="admin-report-entry-date"
+                        type="date"
+                        value={reportEntryDate}
+                        onChange={(e) => setReportEntryDate(e.target.value)}
+                        max={today}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-6">
+                    <div className="rounded-lg border p-4 space-y-4">
+                      <h4 className="font-medium">Instant Report 34</h4>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r34-total-cashes">Total cashes</Label>
+                          <Input
+                            id="admin-r34-total-cashes"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={instant34Form.totalCashes}
+                            onChange={(e) => setInstant34Form((p) => ({ ...p, totalCashes: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                      </div>
+                      <Button onClick={handleSaveReport34} disabled={savingReport34 || loadingReportForms}>
+                        {savingReport34 ? 'Saving…' : 'Save Instant Report 34'}
+                      </Button>
+                    </div>
+
+                    <div className="rounded-lg border p-4 space-y-4">
+                      <h4 className="font-medium">Special Report 50 (Instant Report 50)</h4>
+                      <p className="text-xs text-muted-foreground">
+                        Net Sales = Total Sales − Discount − Cancels − Free Bets · Net Due = Net Sales − Commission − Cashes − Cash Bonus + Service Fee
+                      </p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-total-sales">Total Sales</Label>
+                          <Input
+                            id="admin-r50-total-sales"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.totalSales}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, totalSales: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-season-tkts">Season TKTS</Label>
+                          <Input
+                            id="admin-r50-season-tkts"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.seasonTkts}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, seasonTkts: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-discount">Discount</Label>
+                          <Input
+                            id="admin-r50-discount"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.discount}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, discount: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-cancels">Cancels</Label>
+                          <Input
+                            id="admin-r50-cancels"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.cancels}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, cancels: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-free-bets">Free Bets</Label>
+                          <Input
+                            id="admin-r50-free-bets"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.freeBets}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, freeBets: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label className="text-muted-foreground">Net Sales (auto)</Label>
+                          <Input
+                            readOnly
+                            className="bg-muted"
+                            value={(() => {
+                              const ts = parseFloat(special50Form.totalSales) || 0;
+                              const d = parseFloat(special50Form.discount) || 0;
+                              const c = parseFloat(special50Form.cancels) || 0;
+                              const f = parseFloat(special50Form.freeBets) || 0;
+                              return (ts - d - c - f).toFixed(2);
+                            })()}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-commission">Commission</Label>
+                          <Input
+                            id="admin-r50-commission"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.commission}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, commission: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-cashes">Cashes</Label>
+                          <Input
+                            id="admin-r50-cashes"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.cashes}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, cashes: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-cash-bonus">Cash Bonus</Label>
+                          <Input
+                            id="admin-r50-cash-bonus"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.cashBonus}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, cashBonus: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-claim-bonus">Claim Bonus</Label>
+                          <Input
+                            id="admin-r50-claim-bonus"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.claimBonus}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, claimBonus: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-adjustments">Adjustments</Label>
+                          <Input
+                            id="admin-r50-adjustments"
+                            type="number"
+                            step="0.01"
+                            placeholder="0.00"
+                            value={special50Form.adjustments}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, adjustments: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="admin-r50-service-fee">Service Fee</Label>
+                          <Input
+                            id="admin-r50-service-fee"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={special50Form.serviceFee}
+                            onChange={(e) => setSpecial50Form((p) => ({ ...p, serviceFee: e.target.value }))}
+                            disabled={loadingReportForms}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label className="text-muted-foreground">Net Due (auto)</Label>
+                          <Input
+                            readOnly
+                            className="bg-muted"
+                            value={(() => {
+                              const ts = parseFloat(special50Form.totalSales) || 0;
+                              const d = parseFloat(special50Form.discount) || 0;
+                              const c = parseFloat(special50Form.cancels) || 0;
+                              const f = parseFloat(special50Form.freeBets) || 0;
+                              const netSales = ts - d - c - f;
+                              const comm = parseFloat(special50Form.commission) || 0;
+                              const cashes = parseFloat(special50Form.cashes) || 0;
+                              const cashBonus = parseFloat(special50Form.cashBonus) || 0;
+                              const serviceFee = parseFloat(special50Form.serviceFee) || 0;
+                              return (netSales - comm - cashes - cashBonus + serviceFee).toFixed(2);
+                            })()}
+                          />
+                        </div>
+                      </div>
+                      <Button onClick={handleSaveReport50} disabled={savingReport50 || loadingReportForms}>
+                        {savingReport50 ? 'Saving…' : 'Save Special Report 50'}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
               </CardContent>
             </Card>
 
@@ -773,384 +1320,411 @@ export default function AdminDashboardClient({
             </Tabs>
           </TabsContent>
 
-          {/* Reports Section */}
-          <TabsContent value="reports" className="space-y-6">
-            <Tabs value={reportsTab} onValueChange={(v: string) => {
-              setReportsTab(v as 'overview' | 'mismatches' | 'players' | 'weekly' | 'boxManagement' | 'receipts');
-              if (v === 'mismatches') loadContinuityLogs();
-              if (v === 'weekly') loadWeeklyData();
-              if (v === 'boxManagement') loadBoxes();
-              if (v === 'receipts') loadReceipts();
-            }} className="space-y-6">
-              <TabsList className="bg-white border border-gray-200 p-1">
-                <TabsTrigger value="overview">Overview</TabsTrigger>
-                <TabsTrigger value="mismatches">Mismatches</TabsTrigger>
-                <TabsTrigger value="players">Players</TabsTrigger>
-                <TabsTrigger value="weekly">Weekly</TabsTrigger>
-                <TabsTrigger value="boxManagement">Box Management</TabsTrigger>
-                <TabsTrigger value="receipts">Receipts</TabsTrigger>
-              </TabsList>
+          {/* Reports Section - Admin Reports Dashboard UI */}
+          <TabsContent value="reports" className="mt-0">
+            <div className="bg-gray-50 min-h-[60vh] -mx-4 sm:-mx-6 lg:-mx-8 -mb-8 px-4 sm:px-6 lg:px-8 py-6 lg:py-8">
+              <Tabs value={reportsTab} onValueChange={(v: string) => {
+                setReportsTab(v as 'overview' | 'mismatches' | 'players' | 'weekly' | 'boxManagement' | 'receipts');
+                if (v === 'mismatches') loadContinuityLogs();
+                if (v === 'weekly') loadWeeklyData();
+                if (v === 'boxManagement') loadBoxes();
+                if (v === 'receipts') loadReceipts();
+                if (v === 'overview') loadDailyReportFields(reportDate);
+              }} className="space-y-6">
+                <div className="bg-white rounded-lg border border-gray-200 shadow-sm overflow-x-auto">
+                  <div className="flex border-b border-gray-200">
+                    {[
+                      { id: 'overview', label: 'Overview' },
+                      { id: 'mismatches', label: 'Mismatches' },
+                      { id: 'players', label: 'Players' },
+                      { id: 'weekly', label: 'Weekly' },
+                      { id: 'boxManagement', label: 'Box Management' },
+                      { id: 'receipts', label: 'Receipts' },
+                    ].map((tab) => (
+                      <button
+                        key={tab.id}
+                        onClick={() => setReportsTab(tab.id as typeof reportsTab)}
+                        className={`px-6 py-4 text-sm font-medium whitespace-nowrap transition-colors ${
+                          reportsTab === tab.id
+                            ? 'border-b-2 border-blue-600 text-blue-600'
+                            : 'text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
 
-              <TabsContent value="overview">
+                <div className="animate-fadeIn">
+              <TabsContent value="overview" className="mt-0 space-y-6">
                 <div className="space-y-6">
-                  <Card>
-              <CardHeader>
-                <CardTitle>Expected Cash by Date Range</CardTitle>
-                <CardDescription>Select a date range to calculate expected cash</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="flex flex-col md:flex-row gap-4 items-end">
-                  <div className="flex-1 space-y-2">
-                    <Label htmlFor="dateFrom">From Date</Label>
-                    <Input
-                      id="dateFrom"
-                      type="date"
-                      value={dateRangeFrom}
-                      onChange={(e) => setDateRangeFrom(e.target.value)}
-                      max={today}
-                    />
-                  </div>
-                  <div className="flex-1 space-y-2">
-                    <Label htmlFor="dateTo">To Date</Label>
-                    <Input
-                      id="dateTo"
-                      type="date"
-                      value={dateRangeTo}
-                      onChange={(e) => setDateRangeTo(e.target.value)}
-                      max={today}
-                    />
-                  </div>
-                  <Button onClick={loadDateRangeSummary} disabled={loadingRange || !dateRangeFrom || !dateRangeTo}>
-                    {loadingRange ? 'Calculating...' : 'Calculate'}
-                  </Button>
-                </div>
-                {rangeSummary && (
-                  <div className="mt-4 p-4 bg-muted/50 rounded-lg border">
-                    <div className="text-sm text-muted-foreground mb-2">
-                      Expected Cash for {formatDate(dateRangeFrom)} to {formatDate(dateRangeTo)}
-                    </div>
-                    <div className="text-3xl font-bold">{formatCurrency(rangeSummary.expectedCash)}</div>
-                    <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                      <div>
-                        <div className="text-muted-foreground">Scratch Sales</div>
-                        <div className="font-semibold">{formatCurrency(rangeSummary.scratchSales)}</div>
+                  {/* Date Control - design card */}
+                  <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                    <div className="flex items-center gap-4">
+                      <div className="flex-1">
+                        <label className="block text-sm text-gray-600 mb-2">Report Date</label>
+                        <Input
+                          id="report-date"
+                          type="date"
+                          value={reportDate}
+                          onChange={(e) => {
+                            const d = e.target.value;
+                            setReportDate(d);
+                            loadDailyReportFields(d);
+                          }}
+                          max={today}
+                          className="w-full max-w-xs"
+                        />
                       </div>
-                      <div>
-                        <div className="text-muted-foreground">Online Sales</div>
-                        <div className="font-semibold">{formatCurrency(rangeSummary.onlineSales)}</div>
-                      </div>
-                      <div>
-                        <div className="text-muted-foreground">Grocery Sales</div>
-                        <div className="font-semibold">{formatCurrency(rangeSummary.grocerySales)}</div>
-                      </div>
-                      <div>
-                        <div className="text-muted-foreground">Lottery Cashes</div>
-                        <div className="font-semibold">{formatCurrency(rangeSummary.lotteryCashes)}</div>
-                      </div>
+                      <Button
+                        className="mt-7"
+                        onClick={() => loadDailyReportFields(reportDate)}
+                        disabled={loadingReportFields}
+                      >
+                        Refresh
+                      </Button>
                     </div>
                   </div>
-                )}
-              </CardContent>
-            </Card>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-lg">Today Expected Cash</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-3xl font-bold">{formatCurrency(initialSummary.expectedCash)}</div>
-                </CardContent>
-              </Card>
+                  {/* Generated Report Fields - design list */}
+                  <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+                    <div className="p-6 border-b border-gray-200">
+                      <h2 className="text-xl font-semibold text-gray-900">Generated Report Fields</h2>
+                      <p className="text-sm text-gray-600 mt-1">Report values from daily box entry, lottery reports, and data entry.</p>
+                    </div>
+                    <div className="p-6">
+                      {loadingReportFields && !dailyReportFields && (
+                        <div className="text-sm text-gray-500">Loading report…</div>
+                      )}
+                      {dailyReportFields && (
+                        <div className="space-y-3">
+                          {[
+                            { i: 1, label: 'Scratch Sales Report', value: dailyReportFields.scratchSales, editable: false, highlight: false },
+                            { i: 2, label: 'Online ticket sales (net sales from Special Report 50)', value: dailyReportFields.onlineTicketSales, editable: false, highlight: false },
+                            { i: 3, label: 'Total lottery sales (1+2)', value: dailyReportFields.totalLotterySales, editable: false, highlight: false },
+                            { i: 4, label: 'Total lottery cashing (cashes from Report 34 & 50)', value: dailyReportFields.totalLotteryCashing, editable: false, highlight: false },
+                            { i: 5, label: 'Total Lottery Due (3−4)', value: dailyReportFields.totalLotteryDue, editable: false, highlight: false },
+                            { i: 6, label: 'Total Daily Udhari (net of players)', value: dailyReportFields.totalDailyUdhari, editable: false, highlight: false },
+                            { i: 7, label: 'Lottery cash in Hand (5−6)', value: dailyReportFields.lotteryCashInHand, editable: false, highlight: false },
+                          ].map((field) => (
+                            <div
+                              key={field.i}
+                              className={`flex items-center justify-between py-3 px-4 rounded-lg ${field.highlight ? 'bg-blue-50 border-2 border-blue-200' : 'bg-gray-50'}`}
+                            >
+                              <span className="text-sm text-gray-700">{field.i}. {field.label}</span>
+                              <span className="font-semibold text-gray-900">{formatCurrency(field.value)}</span>
+                            </div>
+                          ))}
+                          <ReportFieldRowEditableList
+                            label="8. Lottery cash at register (data entry)"
+                            value={dailyReportFields.lotteryCashAtRegister}
+                            onSave={(val) => handleSaveCashRegister(reportDate, val, dailyReportFields.totalGroceryCashAtRegister ?? null)}
+                            disabled={savingRegister}
+                          />
+                          <ReportFieldRowEditableList
+                            label="9. Total grocery cash at register (data entry or POS)"
+                            value={dailyReportFields.totalGroceryCashAtRegister}
+                            onSave={(val) => handleSaveCashRegister(reportDate, dailyReportFields.lotteryCashAtRegister ?? null, val)}
+                            disabled={savingRegister}
+                          />
+                          <div className="flex items-center justify-between py-3 px-4 rounded-lg bg-blue-50 border-2 border-blue-200">
+                            <span className="text-sm font-semibold text-gray-900">10. Total cash in hand daily for pickup (7+9)</span>
+                            <span className="text-xl font-semibold text-blue-600">{formatCurrency(dailyReportFields.totalCashInHandDailyForPickup)}</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
 
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-lg">Lottery Due</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-3xl font-bold">{formatCurrency(lotteryDue)}</div>
-                </CardContent>
-              </Card>
+                  {/* Expected Cash by Date Range - design card */}
+                  <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                    <h3 className="text-lg font-semibold text-gray-900 mb-4">Expected Cash by Date Range</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                      <div>
+                        <Label htmlFor="dateFrom" className="text-sm text-gray-600">From Date</Label>
+                        <Input id="dateFrom" type="date" value={dateRangeFrom} onChange={(e) => setDateRangeFrom(e.target.value)} max={today} className="mt-2" />
+                      </div>
+                      <div>
+                        <Label htmlFor="dateTo" className="text-sm text-gray-600">To Date</Label>
+                        <Input id="dateTo" type="date" value={dateRangeTo} onChange={(e) => setDateRangeTo(e.target.value)} max={today} className="mt-2" />
+                      </div>
+                      <div className="flex items-end">
+                        <Button onClick={loadDateRangeSummary} disabled={loadingRange || !dateRangeFrom || !dateRangeTo} className="w-full">
+                          {loadingRange ? 'Calculating...' : 'Calculate'}
+                        </Button>
+                      </div>
+                    </div>
+                    {rangeSummary && (
+                      <div className="mt-6 p-6 bg-gradient-to-r from-green-50 to-blue-50 rounded-lg border border-green-200">
+                        <p className="text-sm text-gray-600 mb-2">Expected Cash for {formatDate(dateRangeFrom)} to {formatDate(dateRangeTo)}</p>
+                        <p className="text-4xl font-bold text-gray-900 mb-4">{formatCurrency(rangeSummary.expectedCash)}</p>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                          <div><p className="text-gray-600">Scratch Sales</p><p className="font-semibold text-gray-900">{formatCurrency(rangeSummary.scratchSales)}</p></div>
+                          <div><p className="text-gray-600">Online Sales</p><p className="font-semibold text-gray-900">{formatCurrency(rangeSummary.onlineSales)}</p></div>
+                          <div><p className="text-gray-600">Grocery Sales</p><p className="font-semibold text-gray-900">{formatCurrency(rangeSummary.grocerySales)}</p></div>
+                          <div><p className="text-gray-600">Lottery Cashes</p><p className="font-semibold text-gray-900">{formatCurrency(rangeSummary.lotteryCashes)}</p></div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
 
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-lg">Outstanding Credit</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-3xl font-bold">{formatCurrency(outstandingCredit)}</div>
-                </CardContent>
-              </Card>
+                  {/* KPI Row - design KPICards */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <KPICard title="Today Expected Cash" value={formatCurrency(initialSummary.expectedCash)} icon={DollarSign} variant="success" />
+                    <KPICard title="Lottery Due" value={formatCurrency(lotteryDue)} icon={TrendingUp} variant="default" />
+                    <KPICard title="Outstanding Credit" value={formatCurrency(outstandingCredit)} icon={AlertCircle} variant="warning" />
+                    <KPICard title="Boxes Mismatched" value={mismatchCount} icon={BoxIcon} variant="danger" subtitle={mismatchCount > 0 ? 'Requires attention' : undefined} />
+                  </div>
 
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-lg">Boxes Mismatched</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-3xl font-bold text-red-600">{mismatchCount}</div>
-                </CardContent>
-              </Card>
-            </div>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Daily Sales Breakdown</CardTitle>
-                <CardDescription>{formatDate(initialSummary.date)}</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-                  <div>
-                    <div className="text-sm text-muted-foreground">Scratch Sales</div>
-                    <div className="text-2xl font-bold">{formatCurrency(initialSummary.scratchSales)}</div>
+                  {/* Daily Sales Breakdown - design list + PieChart */}
+                  <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                    <h3 className="text-lg font-semibold text-gray-900 mb-6">Daily Sales Breakdown</h3>
+                    <p className="text-sm text-gray-600 mb-4">{formatDate(initialSummary.date)}</p>
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                      <div className="space-y-4">
+                        {[
+                          { name: 'Scratch Sales', value: initialSummary.scratchSales, fill: '#3b82f6' },
+                          { name: 'Online Sales', value: initialSummary.onlineSales, fill: '#10b981' },
+                          { name: 'Grocery Sales', value: initialSummary.grocerySales, fill: '#f59e0b' },
+                          { name: 'Lottery Cashes', value: initialSummary.lotteryCashes, fill: '#ef4444' },
+                        ].map((item, index) => (
+                          <div key={index} className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+                            <div className="flex items-center gap-3">
+                              <div className="w-4 h-4 rounded" style={{ backgroundColor: item.fill }} />
+                              <span className="text-sm text-gray-700">{item.name}</span>
+                            </div>
+                            <span className="font-semibold text-gray-900">{formatCurrency(item.value)}</span>
+                          </div>
+                        ))}
+                        <div className="flex items-center justify-between p-4 bg-blue-50 rounded-lg border-2 border-blue-200">
+                          <span className="text-sm font-semibold text-gray-900">Player Balance</span>
+                          <span className="font-semibold text-gray-900">{formatCurrency(initialSummary.playerBalance)}</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-center">
+                        <ResponsiveContainer width="100%" height={300}>
+                          <PieChart>
+                            <Pie
+                              data={[
+                                { name: 'Scratch Sales', value: initialSummary.scratchSales, fill: '#3b82f6' },
+                                { name: 'Online Sales', value: initialSummary.onlineSales, fill: '#10b981' },
+                                { name: 'Grocery Sales', value: initialSummary.grocerySales, fill: '#f59e0b' },
+                                { name: 'Lottery Cashes', value: initialSummary.lotteryCashes, fill: '#ef4444' },
+                              ].filter((d) => d.value > 0)}
+                              cx="50%"
+                              cy="50%"
+                              labelLine={false}
+                              label={({ name, percent }) => `${name}: ${(percent * 100).toFixed(0)}%`}
+                              outerRadius={100}
+                              dataKey="value"
+                            >
+                              {[
+                                { name: 'Scratch Sales', value: initialSummary.scratchSales, fill: '#3b82f6' },
+                                { name: 'Online Sales', value: initialSummary.onlineSales, fill: '#10b981' },
+                                { name: 'Grocery Sales', value: initialSummary.grocerySales, fill: '#f59e0b' },
+                                { name: 'Lottery Cashes', value: initialSummary.lotteryCashes, fill: '#ef4444' },
+                              ]
+                                .filter((d) => d.value > 0)
+                                .map((entry, index) => (
+                                  <Cell key={`cell-${index}`} fill={entry.fill} />
+                                ))}
+                            </Pie>
+                            <Tooltip formatter={(value: number) => formatCurrency(value)} />
+                          </PieChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
                   </div>
-                  <div>
-                    <div className="text-sm text-muted-foreground">Online Sales</div>
-                    <div className="text-2xl font-bold">{formatCurrency(initialSummary.onlineSales)}</div>
-                  </div>
-                  <div>
-                    <div className="text-sm text-muted-foreground">Grocery Sales</div>
-                    <div className="text-2xl font-bold">{formatCurrency(initialSummary.grocerySales)}</div>
-                  </div>
-                  <div>
-                    <div className="text-sm text-muted-foreground">Lottery Cashes</div>
-                    <div className="text-2xl font-bold">{formatCurrency(initialSummary.lotteryCashes)}</div>
-                  </div>
-                  <div>
-                    <div className="text-sm text-muted-foreground">Player Balance</div>
-                    <div className="text-2xl font-bold">{formatCurrency(initialSummary.playerBalance)}</div>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
                 </div>
               </TabsContent>
 
-              <TabsContent value="mismatches">
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Ticket Continuity Logs</CardTitle>
-                    <CardDescription>Mismatches between closing and opening ticket numbers</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <Table>
-                      <TableHeader>
-                        <TableRow>
-                          <TableHead>Date</TableHead>
-                          <TableHead>Box</TableHead>
-                          <TableHead>Previous Close</TableHead>
-                          <TableHead>Today Open</TableHead>
-                          <TableHead>Difference</TableHead>
-                          <TableHead>Severity</TableHead>
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
+              <TabsContent value="mismatches" className="mt-0 space-y-6">
+                <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+                  <div className="p-6 border-b border-gray-200">
+                    <h2 className="text-xl font-semibold text-gray-900">Ticket Continuity Logs</h2>
+                    <p className="text-sm text-gray-600 mt-1">Mismatches between closing and opening ticket numbers</p>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full">
+                      <thead className="bg-gray-50 border-b border-gray-200">
+                        <tr>
+                          <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Date</th>
+                          <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Box</th>
+                          <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Previous Close</th>
+                          <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Today Open</th>
+                          <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Difference</th>
+                          <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Severity</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200">
                         {continuityLogs.length === 0 ? (
-                          <TableRow>
-                            <TableCell colSpan={6} className="text-center text-muted-foreground">
+                          <tr>
+                            <td colSpan={6} className="px-6 py-8 text-center text-sm text-gray-500">
                               No mismatches found
-                            </TableCell>
-                          </TableRow>
+                            </td>
+                          </tr>
                         ) : (
-                          continuityLogs.map((log) => (
-                            <TableRow key={log.id}>
-                              <TableCell>{formatDate(log.date)}</TableCell>
-                              <TableCell>{log.boxes.name}</TableCell>
-                              <TableCell>{log.prev_close}</TableCell>
-                              <TableCell>{log.today_open}</TableCell>
-                              <TableCell>{log.difference}</TableCell>
-                              <TableCell>
-                                <span className={`px-2 py-1 rounded text-xs font-medium ${getSeverityColor(log.severity)}`}>
-                                  {log.severity}
+                          continuityLogs.map((log, index) => (
+                            <tr key={log.id} className={index % 2 === 0 ? 'bg-white hover:bg-gray-50' : 'bg-gray-50 hover:bg-gray-100'}>
+                              <td className="px-6 py-4 text-sm text-gray-900">{formatDate(log.date)}</td>
+                              <td className="px-6 py-4 text-sm font-medium text-gray-900">{log.boxes.name}</td>
+                              <td className="px-6 py-4 text-sm font-mono text-gray-700">{log.prev_close}</td>
+                              <td className="px-6 py-4 text-sm font-mono text-gray-700">{log.today_open}</td>
+                              <td className="px-6 py-4 text-sm font-semibold text-gray-900">{log.difference}</td>
+                              <td className="px-6 py-4 text-sm">
+                                <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${
+                                  log.severity === 'critical' ? 'bg-red-100 text-red-800 border border-red-300' :
+                                  log.severity === 'error' ? 'bg-orange-100 text-orange-800 border border-orange-300' :
+                                  'bg-yellow-100 text-yellow-800 border border-yellow-300'
+                                }`}>
+                                  {log.severity.toUpperCase()}
                                 </span>
-                              </TableCell>
-                            </TableRow>
+                              </td>
+                            </tr>
                           ))
                         )}
-                      </TableBody>
-                    </Table>
-                  </CardContent>
-                </Card>
-              </TabsContent>
-
-              <TabsContent value="players">
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Player Balances</CardTitle>
-                    <CardDescription>Daily activities and current credit balances for all players</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Player Name</TableHead>
-                    <TableHead className="text-right">Played Balance</TableHead>
-                    <TableHead className="text-right">Win Balance</TableHead>
-                    <TableHead className="text-right">Paid Balance</TableHead>
-                    <TableHead className="text-right font-semibold">Total Balance Due</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {playerDailyActivities.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={5} className="text-center text-muted-foreground">
-                        No players found
-                      </TableCell>
-                    </TableRow>
-                  ) : (
-                    playerDailyActivities.map((activity) => (
-                      <TableRow key={activity.playerId}>
-                        <TableCell className="font-medium">{activity.name}</TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {activity.playedBalance > 0 ? (
-                            <span className="text-orange-600">+{formatCurrency(activity.playedBalance)}</span>
-                          ) : (
-                            <span className="text-muted-foreground">—</span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {activity.winBalance > 0 ? (
-                            <span className="text-green-600">-{formatCurrency(activity.winBalance)}</span>
-                          ) : (
-                            <span className="text-muted-foreground">—</span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {activity.paidBalance > 0 ? (
-                            <span className="text-blue-600">-{formatCurrency(activity.paidBalance)}</span>
-                          ) : (
-                            <span className="text-muted-foreground">—</span>
-                          )}
-                        </TableCell>
-                        <TableCell className={`text-right tabular-nums font-semibold ${activity.totalBalanceDue < 0 ? 'text-red-600' : activity.totalBalanceDue > 0 ? 'text-orange-600' : ''}`}>
-                          {formatCurrency(activity.totalBalanceDue)}
-                        </TableCell>
-                      </TableRow>
-                    ))
-                  )}
-                </TableBody>
-              </Table>
-              {playerDailyActivities.length > 0 && (
-                <div className="mt-4 pt-4 border-t">
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                    <div>
-                      <div className="text-muted-foreground">Total Played Today</div>
-                      <div className="text-lg font-semibold text-orange-600">
-                        {formatCurrency(playerDailyActivities.reduce((sum, a) => sum + a.playedBalance, 0))}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-muted-foreground">Total Wins Today</div>
-                      <div className="text-lg font-semibold text-green-600">
-                        {formatCurrency(playerDailyActivities.reduce((sum, a) => sum + a.winBalance, 0))}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-muted-foreground">Total Paid Today</div>
-                      <div className="text-lg font-semibold text-blue-600">
-                        {formatCurrency(playerDailyActivities.reduce((sum, a) => sum + a.paidBalance, 0))}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-muted-foreground">Total Outstanding</div>
-                      <div className="text-lg font-semibold text-red-600">
-                        {formatCurrency(playerDailyActivities.reduce((sum, a) => sum + Math.max(0, a.totalBalanceDue), 0))}
-                      </div>
-                    </div>
+                      </tbody>
+                    </table>
                   </div>
                 </div>
-              )}
-                  </CardContent>
-                </Card>
               </TabsContent>
 
-              <TabsContent value="weekly">
+              <TabsContent value="players" className="mt-0 space-y-6">
+                <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+                  <div className="p-6 border-b border-gray-200">
+                    <h2 className="text-xl font-semibold text-gray-900">Player Balances</h2>
+                    <p className="text-sm text-gray-600 mt-1">Daily activities and current credit balances for all players</p>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full">
+                      <thead className="bg-gray-50 border-b border-gray-200">
+                        <tr>
+                          <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Player Name</th>
+                          <th className="px-6 py-4 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Played Balance</th>
+                          <th className="px-6 py-4 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Win Balance</th>
+                          <th className="px-6 py-4 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Paid Balance</th>
+                          <th className="px-6 py-4 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Total Balance Due</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200">
+                        {playerDailyActivities.length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="px-6 py-8 text-center text-sm text-gray-500">No players found</td>
+                          </tr>
+                        ) : (
+                          playerDailyActivities.map((activity) => (
+                            <tr key={activity.playerId} className="hover:bg-gray-50">
+                              <td className="px-6 py-4 text-sm font-medium text-gray-900">{activity.name}</td>
+                              <td className="px-6 py-4 text-sm text-right font-medium text-blue-600">
+                                {activity.playedBalance > 0 ? `+${formatCurrency(activity.playedBalance)}` : '—'}
+                              </td>
+                              <td className="px-6 py-4 text-sm text-right font-medium text-green-600">
+                                {activity.winBalance > 0 ? `-${formatCurrency(activity.winBalance)}` : '—'}
+                              </td>
+                              <td className="px-6 py-4 text-sm text-right font-medium text-purple-600">
+                                {activity.paidBalance > 0 ? `-${formatCurrency(activity.paidBalance)}` : '—'}
+                              </td>
+                              <td className="px-6 py-4 text-sm text-right">
+                                <span className={`font-semibold ${activity.totalBalanceDue < 0 ? 'text-red-600' : activity.totalBalanceDue > 0 ? 'text-gray-900' : 'text-gray-400'}`}>
+                                  {formatCurrency(activity.totalBalanceDue)}
+                                </span>
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                  {playerDailyActivities.length > 0 && (
+                    <div className="p-6 bg-gradient-to-r from-blue-50 to-purple-50 border-t border-gray-200">
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+                        <div className="text-center">
+                          <p className="text-sm text-gray-600 mb-1">Total Played Today</p>
+                          <p className="text-2xl font-bold text-blue-600">{formatCurrency(playerDailyActivities.reduce((sum, a) => sum + a.playedBalance, 0))}</p>
+                        </div>
+                        <div className="text-center">
+                          <p className="text-sm text-gray-600 mb-1">Total Wins Today</p>
+                          <p className="text-2xl font-bold text-green-600">{formatCurrency(playerDailyActivities.reduce((sum, a) => sum + a.winBalance, 0))}</p>
+                        </div>
+                        <div className="text-center">
+                          <p className="text-sm text-gray-600 mb-1">Total Paid Today</p>
+                          <p className="text-2xl font-bold text-purple-600">{formatCurrency(playerDailyActivities.reduce((sum, a) => sum + a.paidBalance, 0))}</p>
+                        </div>
+                        <div className="text-center">
+                          <p className="text-sm text-gray-600 mb-1">Total Outstanding</p>
+                          <p className={`text-2xl font-bold ${playerDailyActivities.reduce((sum, a) => sum + Math.max(0, a.totalBalanceDue), 0) > 0 ? 'text-red-600' : 'text-gray-900'}`}>
+                            {formatCurrency(playerDailyActivities.reduce((sum, a) => sum + Math.max(0, a.totalBalanceDue), 0))}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="weekly" className="mt-0 space-y-6">
                 <div className="space-y-6">
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>Weekly Cash Flow</CardTitle>
-                      <CardDescription>Expected cash over the last 7 days</CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={weeklyData}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis
-                      dataKey="date"
-                      tickFormatter={(value) => formatDate(value)}
-                    />
-                    <YAxis tickFormatter={(value) => `$${value}`} />
-                    <Tooltip
-                      formatter={(value: number) => formatCurrency(value)}
-                      labelFormatter={(label) => formatDate(label)}
-                    />
-                    <Legend />
-                    <Line
-                      type="monotone"
-                      dataKey="expectedCash"
-                      stroke="#8884d8"
-                      name="Expected Cash"
-                      strokeWidth={2}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-                    </CardContent>
-                  </Card>
+                  <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                    <h3 className="text-lg font-semibold text-gray-900 mb-6">Weekly Cash Flow</h3>
+                    <p className="text-sm text-gray-600 mb-4">Expected cash over the last 7 days</p>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <LineChart data={weeklyData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                        <XAxis dataKey="date" tickFormatter={(value) => formatDate(value)} stroke="#6b7280" />
+                        <YAxis stroke="#6b7280" tickFormatter={(value) => `$${value}`} />
+                        <Tooltip formatter={(value: number) => formatCurrency(value)} labelFormatter={(label) => formatDate(label)} contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px' }} />
+                        <Line type="monotone" dataKey="expectedCash" stroke="#3b82f6" name="Expected Cash" strokeWidth={3} dot={{ fill: '#3b82f6', r: 5 }} activeDot={{ r: 7 }} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
 
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>Weekly Sales Breakdown</CardTitle>
-                      <CardDescription>Sales by category over the last 7 days</CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                <ResponsiveContainer width="100%" height={300}>
-                  <BarChart data={weeklyData}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis
-                      dataKey="date"
-                      tickFormatter={(value) => formatDate(value)}
-                    />
-                    <YAxis tickFormatter={(value) => `$${value}`} />
-                    <Tooltip
-                      formatter={(value: number) => formatCurrency(value)}
-                      labelFormatter={(label) => formatDate(label)}
-                    />
-                    <Legend />
-                    <Bar dataKey="scratchSales" fill="#8884d8" name="Scratch Sales" />
-                    <Bar dataKey="onlineSales" fill="#82ca9d" name="Online Sales" />
-                    <Bar dataKey="grocerySales" fill="#ffc658" name="Grocery Sales" />
-                  </BarChart>
-                </ResponsiveContainer>
-                    </CardContent>
-                  </Card>
+                  <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                    <h3 className="text-lg font-semibold text-gray-900 mb-6">Weekly Sales Breakdown</h3>
+                    <p className="text-sm text-gray-600 mb-4">Sales by category over the last 7 days</p>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <BarChart data={weeklyData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                        <XAxis dataKey="date" tickFormatter={(value) => formatDate(value)} stroke="#6b7280" />
+                        <YAxis stroke="#6b7280" tickFormatter={(value) => `$${value}`} />
+                        <Tooltip formatter={(value: number) => formatCurrency(value)} contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px' }} />
+                        <Legend />
+                        <Bar dataKey="scratchSales" fill="#3b82f6" name="Scratch Sales" />
+                        <Bar dataKey="onlineSales" fill="#10b981" name="Online Sales" />
+                        <Bar dataKey="grocerySales" fill="#f59e0b" name="Grocery Sales" />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
 
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>Weekly Summary Table</CardTitle>
-                    </CardHeader>
-                    <CardContent>
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Date</TableHead>
-                      <TableHead>Scratch</TableHead>
-                      <TableHead>Online</TableHead>
-                      <TableHead>Grocery</TableHead>
-                      <TableHead>Expected Cash</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {weeklyData.map((day) => (
-                      <TableRow key={day.date}>
-                        <TableCell>{formatDate(day.date)}</TableCell>
-                        <TableCell>{formatCurrency(day.scratchSales)}</TableCell>
-                        <TableCell>{formatCurrency(day.onlineSales)}</TableCell>
-                        <TableCell>{formatCurrency(day.grocerySales)}</TableCell>
-                        <TableCell className="font-bold">{formatCurrency(day.expectedCash)}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-                    </CardContent>
-                  </Card>
+                  <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+                    <div className="p-6 border-b border-gray-200">
+                      <h3 className="text-lg font-semibold text-gray-900">Weekly Summary</h3>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full">
+                        <thead className="bg-gray-50 border-b border-gray-200">
+                          <tr>
+                            <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Date</th>
+                            <th className="px-6 py-4 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Scratch</th>
+                            <th className="px-6 py-4 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Online</th>
+                            <th className="px-6 py-4 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Grocery</th>
+                            <th className="px-6 py-4 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Expected Cash</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-200">
+                          {weeklyData.map((day, index) => (
+                            <tr key={day.date} className={index === weeklyData.length - 1 ? 'bg-blue-50' : 'hover:bg-gray-50'}>
+                              <td className="px-6 py-4 text-sm font-medium text-gray-900">{formatDate(day.date)}</td>
+                              <td className="px-6 py-4 text-sm text-right font-medium text-blue-600">{formatCurrency(day.scratchSales)}</td>
+                              <td className="px-6 py-4 text-sm text-right font-medium text-green-600">{formatCurrency(day.onlineSales)}</td>
+                              <td className="px-6 py-4 text-sm text-right font-medium text-amber-600">{formatCurrency(day.grocerySales)}</td>
+                              <td className="px-6 py-4 text-sm text-right font-semibold text-gray-900">{formatCurrency(day.expectedCash)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
                 </div>
               </TabsContent>
 
@@ -1318,24 +1892,22 @@ export default function AdminDashboardClient({
                 </div>
               </TabsContent>
 
-              <TabsContent value="receipts">
+              <TabsContent value="receipts" className="mt-0 space-y-6">
                 <div className="space-y-6">
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>Uploaded Receipts</CardTitle>
-                      <CardDescription>View all uploaded lottery and POS receipts</CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                <div className="space-y-6">
+                  <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                    <h2 className="text-xl font-semibold text-gray-900">Uploaded Receipts</h2>
+                    <p className="text-sm text-gray-600 mt-1">View all uploaded lottery and POS receipts</p>
+                  </div>
+                  <div className="space-y-6">
                   {/* Lottery Reports */}
-                  <div>
-                    <h3 className="text-lg font-semibold mb-4">Lottery Reports</h3>
+                  <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                    <h3 className="text-lg font-semibold text-gray-900 mb-6">Lottery Reports</h3>
                     {lotteryReportsList.length === 0 ? (
-                      <p className="text-muted-foreground">No lottery reports uploaded yet.</p>
+                      <p className="text-gray-500">No lottery reports uploaded yet.</p>
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                         {lotteryReportsList.map((report) => (
-                          <Card key={report.id} className="overflow-hidden hover:shadow-lg transition-shadow">
+                          <Card key={report.id} className="overflow-hidden hover:shadow-lg transition-all hover:scale-105 border border-blue-200 bg-gradient-to-br from-blue-50 to-blue-100">
                             <CardContent className="p-0">
                               {report.raw_image_url ? (
                                 <div 
@@ -1475,14 +2047,14 @@ export default function AdminDashboardClient({
                   </div>
 
                   {/* POS Reports */}
-                  <div>
-                    <h3 className="text-lg font-semibold mb-4">POS Terminal Receipts</h3>
+                  <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                    <h3 className="text-lg font-semibold text-gray-900 mb-6">POS Terminal Receipts</h3>
                     {posReportsList.length === 0 ? (
-                      <p className="text-muted-foreground">No POS receipts uploaded yet.</p>
+                      <p className="text-gray-500">No POS receipts uploaded yet.</p>
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                         {posReportsList.map((report) => (
-                          <Card key={report.id} className="overflow-hidden hover:shadow-lg transition-shadow">
+                          <Card key={report.id} className="overflow-hidden hover:shadow-lg transition-all hover:scale-105 border border-green-200 bg-gradient-to-br from-green-50 to-green-100">
                             <CardContent className="p-0">
                               {report.raw_image_url ? (
                                 <div 
@@ -1533,176 +2105,12 @@ export default function AdminDashboardClient({
                       </div>
                     )}
                   </div>
-                    </div>
-                  </CardContent>
-                </Card>
+                  </div>
                 </div>
               </TabsContent>
-
-              <TabsContent value="boxManagement">
-                <div className="space-y-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>{editingBox ? 'Edit Box' : 'Create New Box'}</CardTitle>
-                <CardDescription>
-                  {editingBox ? 'Update box details' : 'Add a new box to the system'}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <Label>Box Name</Label>
-                    <Input
-                      value={boxForm.name}
-                      onChange={(e) => setBoxForm({ ...boxForm, name: e.target.value })}
-                      placeholder="Box no 1"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>Box Number (1-80, optional - auto-assigned if empty)</Label>
-                    <Input
-                      type="number"
-                      min="1"
-                      max="80"
-                      value={boxForm.boxNumber}
-                      onChange={(e) => setBoxForm({ ...boxForm, boxNumber: e.target.value })}
-                      placeholder="Auto-assign"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>Ticket Value</Label>
-                    <div className="flex gap-2">
-                      <select
-                        value={boxForm.useCustomValue ? 'custom' : boxForm.ticketValue}
-                        onChange={(e) => {
-                          if (e.target.value === 'custom') {
-                            setBoxForm({ ...boxForm, useCustomValue: true, ticketValue: '' });
-                          } else {
-                            setBoxForm({ ...boxForm, useCustomValue: false, ticketValue: e.target.value });
-                          }
-                        }}
-                        className="flex-1 h-10 rounded-md border border-input bg-background px-3 py-2"
-                      >
-                        <option value="">Select value...</option>
-                        {PREDEFINED_TICKET_VALUES.map((val) => (
-                          <option key={val} value={val}>
-                            ${val}
-                          </option>
-                        ))}
-                        <option value="custom">Custom value...</option>
-                      </select>
-                      {boxForm.useCustomValue && (
-                        <Input
-                          type="number"
-                          step="0.01"
-                          min="0.01"
-                          value={boxForm.ticketValue}
-                          onChange={(e) => setBoxForm({ ...boxForm, ticketValue: e.target.value })}
-                          placeholder="0.00"
-                          className="w-32"
-                        />
-                      )}
-                    </div>
-                  </div>
-                  <div className="space-y-2">
-                    <Label>Category</Label>
-                    <select
-                      value={boxForm.category}
-                      onChange={(e) => setBoxForm({ ...boxForm, category: e.target.value as any })}
-                      className="w-full h-10 rounded-md border border-input bg-background px-3 py-2"
-                    >
-                      <option value="regular">Regular</option>
-                      <option value="high">High</option>
-                      <option value="seasonal">Seasonal</option>
-                    </select>
-                  </div>
                 </div>
-                <div className="flex gap-2 mt-4">
-                  {editingBox ? (
-                    <>
-                      <Button onClick={handleUpdateBox} disabled={loading}>
-                        Update Box
-                      </Button>
-                      <Button onClick={cancelEdit} variant="outline" disabled={loading}>
-                        Cancel
-                      </Button>
-                    </>
-                  ) : (
-                    <Button onClick={handleCreateBox} disabled={loading}>
-                      Create Box
-                    </Button>
-                  )}
-                </div>
-              </CardContent>
-                  </Card>
-
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>All Boxes</CardTitle>
-                      <CardDescription>Manage existing boxes (sorted by box number)</CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                      <div className="rounded-md border overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Box #</TableHead>
-                        <TableHead>Name</TableHead>
-                        <TableHead>Ticket Value</TableHead>
-                        <TableHead>Category</TableHead>
-                        <TableHead className="text-right">Actions</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {boxes.length === 0 ? (
-                        <TableRow>
-                          <TableCell colSpan={5} className="text-center text-muted-foreground">
-                            No boxes found
-                          </TableCell>
-                        </TableRow>
-                      ) : (
-                        boxes.map((box) => (
-                          <TableRow key={box.id}>
-                            <TableCell className="font-medium">
-                              {box.box_number ?? '—'}
-                            </TableCell>
-                            <TableCell>{box.name}</TableCell>
-                            <TableCell>{formatCurrency(box.ticket_value)}</TableCell>
-                            <TableCell>
-                              <span className="capitalize">{box.category}</span>
-                            </TableCell>
-                            <TableCell className="text-right">
-                              <div className="flex justify-end gap-2">
-                                <Button
-                                  onClick={() => startEditBox(box)}
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={loading}
-                                >
-                                  Edit
-                                </Button>
-                                <Button
-                                  onClick={() => handleDeleteBox(box.id)}
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={loading}
-                                  className="text-red-600 hover:text-red-700"
-                                >
-                                  Delete
-                                </Button>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                        ))
-                      )}
-                    </TableBody>
-                  </Table>
-                </div>
-                    </CardContent>
-                  </Card>
-                </div>
-              </TabsContent>
-            </Tabs>
+              </Tabs>
+            </div>
           </TabsContent>
         </Tabs>
 
@@ -1741,7 +2149,12 @@ function DailyBoxEntrySheet({
   today,
   activatedBooksForDate = [],
   onSaveAll,
+  onSaveOpenNumbers,
+  onSaveCloseNumbers,
+  onSubmitDay,
   loading,
+  loadingOpen,
+  loadingClose,
   isAdmin = true,
   isSubmitted = false,
 }: {
@@ -1749,14 +2162,19 @@ function DailyBoxEntrySheet({
   entries: Record<string, Entry>;
   today: string;
   activatedBooksForDate?: ActivatedBookForDate[];
-  onSaveAll: (updates: Array<{ 
-    boxId: string; 
-    openNumber: number; 
+  onSaveAll: (updates: Array<{
+    boxId: string;
+    openNumber: number | null;
     closeNumber: number | null;
     newBoxStartNumber?: number | null;
     activatedBookId?: string | null;
   }>) => void;
+  onSaveOpenNumbers?: (updates: Array<{ boxId: string; openNumber: number | null; newBoxStartNumber?: number | null; activatedBookId?: string | null }>) => void;
+  onSaveCloseNumbers?: (updates: Array<{ boxId: string; closeNumber: number | null }>) => void;
+  onSubmitDay?: () => void;
   loading: boolean;
+  loadingOpen?: boolean;
+  loadingClose?: boolean;
   isAdmin?: boolean;
   isSubmitted?: boolean;
 }) {
@@ -1773,21 +2191,21 @@ function DailyBoxEntrySheet({
     activatedBooksForDate.map((ab) => [ab.box_id, ab])
   );
 
+  // Sold semantics: 0 = valid value (1 ticket); "-" = null (no ticket). Helpers from @/lib/utils/entries
   const [formValues, setFormValues] = useState<Record<string, { open: string; close: string; newBoxStart: string }>>(
     () =>
       Object.fromEntries(
         sortedBoxes.map((box) => {
           const entry = entries[box.id];
           const activatedBook = activatedBooksByBox[box.id];
-          // Prefer entry value; else use activated book's start_ticket_number when linked
           const newBoxStart =
             entry?.new_box_start_number?.toString() ??
             (activatedBook ? String(activatedBook.start_ticket_number) : '');
           return [
             box.id,
             {
-              open: entry?.open_number?.toString() ?? '',
-              close: entry?.close_number?.toString() ?? '',
+              open: openDisplay(entry),
+              close: closeDisplay(entry),
               newBoxStart,
             },
           ];
@@ -1795,7 +2213,19 @@ function DailyBoxEntrySheet({
       )
   );
 
-  // Sync form from entries and activated books when they change
+  // Stable key so sync effect only runs when server data (entries/boxes/activatedBooks) actually changes — not on every render (which would overwrite user typing)
+  const entriesSyncKey = useMemo(
+    () =>
+      sortedBoxes
+        .map((b) => {
+          const e = entries[b.id];
+          const ab = activatedBooksByBox[b.id];
+          const n = e?.new_box_start_number ?? ab?.start_ticket_number ?? '';
+          return `${e?.open_number ?? '-'}|${e?.close_number ?? '-'}|${n}`;
+        })
+        .join(';'),
+    [entries, activatedBooksForDate, boxes]
+  );
   useEffect(() => {
     setFormValues((prev) => {
       const next = { ...prev };
@@ -1803,8 +2233,8 @@ function DailyBoxEntrySheet({
       sortedBoxes.forEach((box) => {
         const entry = entries[box.id];
         const activatedBook = activatedBooksByBox[box.id];
-        const open = entry?.open_number?.toString() ?? '';
-        const close = entry?.close_number?.toString() ?? '';
+        const open = openDisplay(entry);
+        const close = closeDisplay(entry);
         const newBoxStart =
           entry?.new_box_start_number?.toString() ??
           (activatedBook ? String(activatedBook.start_ticket_number) : '');
@@ -1815,19 +2245,27 @@ function DailyBoxEntrySheet({
       });
       return changed ? next : prev;
     });
-  }, [entries, activatedBooksForDate]);
+  }, [entriesSyncKey]);
 
   const setBoxValue = (boxId: string, field: 'open' | 'close' | 'newBoxStart', value: string) => {
-    setFormValues((prev) => ({
-      ...prev,
-      [boxId]: { ...prev[boxId], [field]: value },
-    }));
+    if (field === 'open' || field === 'close') {
+      if (value !== '-' && value !== '') {
+        const n = parseFloat(value);
+        if (!Number.isNaN(n) && n < 0) value = '0';
+      }
+    }
+    setFormValues((prev) => {
+      const current = prev[boxId] ?? { open: '', close: '', newBoxStart: '' };
+      const next = { open: current.open, close: current.close, newBoxStart: current.newBoxStart };
+      next[field] = value;
+      return { ...prev, [boxId]: next };
+    });
   };
 
   const handleSaveAll = () => {
-    const updates: Array<{ 
-      boxId: string; 
-      openNumber: number; 
+    const updates: Array<{
+      boxId: string;
+      openNumber: number | null;
       closeNumber: number | null;
       newBoxStartNumber?: number | null;
       activatedBookId?: string | null;
@@ -1835,31 +2273,66 @@ function DailyBoxEntrySheet({
     sortedBoxes.forEach((box) => {
       const v = formValues[box.id];
       if (!v) return;
-      const openNum = parseInt(v.open, 10);
-      if (isNaN(openNum)) return;
-      
-      const closeNum = v.close.trim() ? parseInt(v.close, 10) : null;
-      const newBoxStartNum = v.newBoxStart.trim() ? parseInt(v.newBoxStart, 10) : null;
+      if (v.open.trim() === '' && v.close.trim() === '' && v.newBoxStart.trim() === '') return;
+      const openNum = parseOpenClose(v.open);
+      const closeNum = parseOpenClose(v.close);
+      const rawNewBox = v.newBoxStart.trim() ? parseInt(v.newBoxStart, 10) : null;
+      const newBoxStartNum = rawNewBox != null && !Number.isNaN(rawNewBox) ? rawNewBox : null;
       const activatedBook = activatedBooksByBox[box.id];
-      // Link to activated book when value matches the book's start_ticket_number
       const activatedBookId =
-        activatedBook && newBoxStartNum === activatedBook.start_ticket_number
+        activatedBook && newBoxStartNum !== null && newBoxStartNum === activatedBook.start_ticket_number
           ? activatedBook.id
           : null;
-
-      updates.push({ 
-        boxId: box.id, 
-        openNumber: openNum, 
+      updates.push({
+        boxId: box.id,
+        openNumber: openNum,
         closeNumber: closeNum,
         newBoxStartNumber: newBoxStartNum,
         activatedBookId: activatedBookId ?? undefined,
       });
     });
     if (updates.length === 0) {
-      alert('Enter at least one opening number.');
+      alert('Enter at least one value (number or -) for open or close.');
       return;
     }
     onSaveAll(updates);
+  };
+
+  const handleSaveOpenNumbers = () => {
+    if (!onSaveOpenNumbers) return;
+    const updates: Array<{ boxId: string; openNumber: number | null; newBoxStartNumber?: number | null; activatedBookId?: string | null }> = [];
+    sortedBoxes.forEach((box) => {
+      const v = formValues[box.id];
+      if (!v || v.open.trim() === '') return;
+      const openNum = parseOpenClose(v.open);
+      const rawNewBox = v.newBoxStart.trim() ? parseInt(v.newBoxStart, 10) : null;
+      const newBoxStartNum = rawNewBox != null && !Number.isNaN(rawNewBox) ? rawNewBox : null;
+      const activatedBook = activatedBooksByBox[box.id];
+      const activatedBookId =
+        activatedBook && newBoxStartNum !== null && newBoxStartNum === activatedBook.start_ticket_number ? activatedBook.id : null;
+      updates.push({ boxId: box.id, openNumber: openNum, newBoxStartNumber: newBoxStartNum, activatedBookId: activatedBookId ?? undefined });
+    });
+    if (updates.length === 0) {
+      alert('Enter at least one open value (number or -).');
+      return;
+    }
+    onSaveOpenNumbers(updates);
+  };
+
+  const handleSaveCloseNumbers = () => {
+    if (!onSaveCloseNumbers) return;
+    const updates: Array<{ boxId: string; closeNumber: number | null }> = [];
+    sortedBoxes.forEach((box) => {
+      const v = formValues[box.id];
+      if (!v || v.close.trim() === '') return;
+      const closeNum = parseOpenClose(v.close);
+      updates.push({ boxId: box.id, closeNumber: closeNum });
+    });
+    if (updates.length === 0) {
+      alert('Enter at least one close value (number or -).');
+      return;
+    }
+    onSaveCloseNumbers(updates);
   };
 
   return (
@@ -1869,44 +2342,48 @@ function DailyBoxEntrySheet({
         <CardDescription>
           {readOnly
             ? 'This date has been submitted. Only admin can edit.'
-            : 'Tickets are 0-based (e.g. 50 tickets = 0 to 49). Enter Open # (required) and Close # (optional). New box start # is pre-filled from activated books—add a book in the &quot;Activated books&quot; tab first. Sold and Amount are calculated after you press Save.'}
+            : 'Tickets are 0-based. Enter Open # and Close #, or "-" when the box was not refilled (tickets finished). Sold and Amount update as you type and after Save.'}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="rounded-md border overflow-x-auto">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-24">Box #</TableHead>
-                <TableHead>Name</TableHead>
-                <TableHead className="w-24 text-muted-foreground font-normal text-xs">New box start #<br /><span className="text-[10px]">(from activated book)</span></TableHead>
-                <TableHead className="w-28">Ticket</TableHead>
-                <TableHead className="w-28">Open #</TableHead>
-                <TableHead className="w-28">Close #</TableHead>
-                <TableHead className="w-20 text-muted-foreground font-normal">Sold (calc.)</TableHead>
-                <TableHead className="w-24 text-muted-foreground font-normal">Amount (calc.)</TableHead>
-              </TableRow>
-            </TableHeader>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-24">Box #</TableHead>
+                      <TableHead>Name</TableHead>
+                      <TableHead className="w-24 text-muted-foreground font-normal text-xs">New box start #<br /><span className="text-[10px]">(from activated book)</span></TableHead>
+                      <TableHead className="w-28">Ticket</TableHead>
+                      <TableHead className="w-28">Open #</TableHead>
+                      <TableHead className="w-28">Close #</TableHead>
+                      <TableHead className="sticky right-[5.5rem] min-w-[4.5rem] w-24 bg-muted/80 backdrop-blur-sm z-10 border-l font-semibold text-foreground">
+                        Sold <span className="text-[10px] font-normal text-muted-foreground">(live)</span>
+                      </TableHead>
+                      <TableHead className="sticky right-0 min-w-[5.5rem] w-28 bg-muted/80 backdrop-blur-sm z-10 border-l font-semibold text-foreground">
+                        Amount <span className="text-[10px] font-normal text-muted-foreground">(live)</span>
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
             <TableBody>
               {sortedBoxes.map((box) => {
                 const entry = entries[box.id];
-                const v = formValues[box.id] ?? { open: '', close: '', newBoxStart: '' };
-                const openNum = parseInt(v.open, 10);
-                const closeNum = v.close.trim() ? parseInt(v.close, 10) : null;
-                const newBoxStartNum = v.newBoxStart.trim() ? parseInt(v.newBoxStart, 10) : null;
-                const hasOpen = !isNaN(openNum);
-                // Use server-calculated values after save when available
-                const soldFromServer = entry?.sold_count ?? null;
-                const amountFromServer = entry?.sold_amount ?? null;
-                let sold: number | null = soldFromServer;
-                if (sold === null && hasOpen) {
-                  if (newBoxStartNum !== null) {
-                    sold = openNum - (closeNum ?? 0) + newBoxStartNum + 1 + (closeNum === null ? 1 : 0);
-                  } else {
-                    sold = openNum - (closeNum ?? 0) + (closeNum === null ? 1 : 0);
-                  }
-                }
-                const amount = amountFromServer !== null ? amountFromServer : (sold !== null && box.ticket_value != null ? sold * box.ticket_value : null);
+                const raw = formValues[box.id];
+                const v = {
+                  open: raw?.open ?? '',
+                  close: raw?.close ?? '',
+                  newBoxStart: raw?.newBoxStart ?? '',
+                };
+                const openNum = parseOpenClose(v.open);
+                const closeNum = parseOpenClose(v.close);
+                const newBoxStartNum = (v.newBoxStart || '').trim() ? parseInt(v.newBoxStart, 10) : null;
+                // Always compute from current form so Sold/Amount update live before saving
+                const openVal = openNum ?? 0;
+                const closeVal = closeNum ?? 0;
+                const sold =
+                  newBoxStartNum != null && !Number.isNaN(newBoxStartNum)
+                    ? newBoxStartNum + openVal - closeVal
+                    : closeVal - openVal;
+                const amount = box.ticket_value != null ? sold * box.ticket_value : null;
                 return (
                   <TableRow key={box.id}>
                     <TableCell className="font-medium">
@@ -1915,15 +2392,12 @@ function DailyBoxEntrySheet({
                     <TableCell>{box.name}</TableCell>
                     <TableCell className="align-top">
                       <div className="flex flex-col gap-1">
-                        <Input
-                          type="number"
-                          placeholder="—"
-                          className="w-20 h-9 text-xs text-muted-foreground"
-                          value={v.newBoxStart}
-                          onChange={(e) => setBoxValue(box.id, 'newBoxStart', e.target.value)}
-                          title="New box start # (from activated book or manual)"
-                          disabled={readOnly}
-                        />
+                        <div
+                          className="min-h-9 w-20 flex items-center text-xs tabular-nums text-muted-foreground border border-transparent"
+                          title="New box start # (from activated book — view only)"
+                        >
+                          {v.newBoxStart ? v.newBoxStart : '—'}
+                        </div>
                         {activatedBooksByBox[box.id] && (
                           <span className="text-[10px] text-muted-foreground" title="Activated book for this date">
                             from book
@@ -1936,8 +2410,9 @@ function DailyBoxEntrySheet({
                     </TableCell>
                     <TableCell>
                       <Input
-                        type="number"
-                        placeholder="Open"
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="Open or -"
                         className="w-24 h-9"
                         value={v.open}
                         onChange={(e) => setBoxValue(box.id, 'open', e.target.value)}
@@ -1946,8 +2421,9 @@ function DailyBoxEntrySheet({
                     </TableCell>
                     <TableCell>
                       <Input
-                        type="number"
-                        placeholder="Close (optional)"
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="Close or -"
                         className="w-24 h-9"
                         value={v.close}
                         onChange={(e) => setBoxValue(box.id, 'close', e.target.value)}
@@ -1955,28 +2431,57 @@ function DailyBoxEntrySheet({
                       />
                     </TableCell>
                     <TableCell
-                      className="min-w-[4rem] tabular-nums font-semibold text-foreground bg-muted/50 px-3 py-2 rounded select-none border border-border/50"
-                      title="Calculated after Save"
+                      className="sticky right-[5.5rem] min-w-[4.5rem] tabular-nums font-semibold text-foreground bg-muted/80 backdrop-blur-sm z-10 border-l px-3 py-2 rounded-l border border-border/50"
+                      title="Auto: tickets sold (from open/close/new box)"
                     >
                       {sold !== null ? sold : '—'}
                     </TableCell>
                     <TableCell
-                      className="min-w-[5rem] tabular-nums font-semibold text-foreground bg-muted/50 px-3 py-2 rounded select-none border border-border/50"
-                      title="Calculated after Save: Sold × Ticket value"
+                      className="sticky right-0 min-w-[5.5rem] tabular-nums font-semibold text-foreground bg-muted/80 backdrop-blur-sm z-10 border-l px-3 py-2 rounded-r border border-border/50"
+                      title="Auto: Sold × ticket value"
                     >
                       {amount !== null ? formatCurrency(amount) : '—'}
                     </TableCell>
                   </TableRow>
                 );
               })}
+              {!readOnly && (onSaveOpenNumbers != null || onSaveCloseNumbers != null) && (
+                <TableRow className="bg-muted/30">
+                  <TableCell colSpan={4} className="text-muted-foreground text-xs">
+                    Save when store opens / closes (one-time)
+                  </TableCell>
+                  <TableCell className="align-middle">
+                    {onSaveOpenNumbers && (
+                      <Button size="sm" variant="secondary" onClick={handleSaveOpenNumbers} disabled={loadingOpen}>
+                        {loadingOpen ? 'Saving…' : 'Save open numbers'}
+                      </Button>
+                    )}
+                  </TableCell>
+                  <TableCell className="align-middle">
+                    {onSaveCloseNumbers && (
+                      <Button size="sm" variant="secondary" onClick={handleSaveCloseNumbers} disabled={loadingClose}>
+                        {loadingClose ? 'Saving…' : 'Save close numbers'}
+                      </Button>
+                    )}
+                  </TableCell>
+                  <TableCell colSpan={2} />
+                </TableRow>
+              )}
             </TableBody>
           </Table>
         </div>
         {!readOnly && (
-          <div className="flex justify-end">
-            <Button onClick={handleSaveAll} disabled={loading}>
-              {loading ? 'Saving…' : 'Save all entries'}
-            </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            {onSubmitDay && (
+              <Button variant="outline" onClick={onSubmitDay} disabled={loading}>
+                {loading ? 'Submitting…' : 'Submit day'}
+              </Button>
+            )}
+            {isAdmin && (
+              <Button onClick={handleSaveAll} disabled={loading}>
+                {loading ? 'Saving…' : 'Save all entries'}
+              </Button>
+            )}
           </div>
         )}
       </CardContent>
@@ -2077,6 +2582,107 @@ function ActivatedBookForm({
       <Button onClick={handleSubmit} disabled={loading || !boxId || !ticketCount}>
         Add activated book
       </Button>
+    </div>
+  );
+}
+
+function ActivatedBookEditForm({
+  boxes,
+  initial,
+  onSave,
+  onCancel,
+  loading,
+}: {
+  boxes: Box[];
+  initial: { box_id: string; activated_date: string; start_ticket_number: number; ticket_count: number; note: string | null };
+  onSave: (updates: { boxId?: string; activatedDate?: string; startTicketNumber?: number; ticketCount?: number; note?: string | null }) => Promise<void>;
+  onCancel: () => void;
+  loading: boolean;
+}) {
+  const sortedBoxes = [...boxes].sort((a, b) => (a.box_number ?? 999) - (b.box_number ?? 999));
+  const [boxId, setBoxId] = useState(initial.box_id);
+  const [activatedDate, setActivatedDate] = useState(initial.activated_date);
+  const [startTicketNumber, setStartTicketNumber] = useState(String(initial.start_ticket_number));
+  const [ticketCount, setTicketCount] = useState(String(initial.ticket_count));
+  const [note, setNote] = useState(initial.note ?? '');
+
+  const handleSubmit = async () => {
+    const start = parseInt(startTicketNumber, 10);
+    const count = parseInt(ticketCount, 10);
+    if (!boxId || isNaN(start) || isNaN(count) || count < 1) {
+      alert('Select a box and enter a valid start number and ticket count.');
+      return;
+    }
+    await onSave({
+      boxId,
+      activatedDate,
+      startTicketNumber: start,
+      ticketCount: count,
+      note: note.trim() || null,
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label>Box</Label>
+          <select
+            value={boxId}
+            onChange={(e) => setBoxId(e.target.value)}
+            className="w-full h-10 rounded-md border border-input bg-background px-3 py-2"
+          >
+            <option value="">— Select box —</option>
+            {sortedBoxes.map((box) => (
+              <option key={box.id} value={box.id}>
+                {box.box_number != null ? `Box ${box.box_number}` : ''} {box.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-2">
+          <Label>Activated date</Label>
+          <Input
+            type="date"
+            value={activatedDate}
+            onChange={(e) => setActivatedDate(e.target.value)}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label>Start ticket # (0-based)</Label>
+          <Input
+            type="number"
+            min={0}
+            value={startTicketNumber}
+            onChange={(e) => setStartTicketNumber(e.target.value)}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label>Ticket count</Label>
+          <Input
+            type="number"
+            min={1}
+            value={ticketCount}
+            onChange={(e) => setTicketCount(e.target.value)}
+          />
+        </div>
+      </div>
+      <div className="space-y-2">
+        <Label>Note (optional)</Label>
+        <Input
+          placeholder="e.g. New roll"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
+      </div>
+      <div className="flex gap-2">
+        <Button onClick={handleSubmit} disabled={loading}>
+          Save
+        </Button>
+        <Button type="button" variant="outline" onClick={onCancel} disabled={loading}>
+          Cancel
+        </Button>
+      </div>
     </div>
   );
 }
@@ -2291,23 +2897,49 @@ function POSReportUpload({
     setOcrData(null);
 
     try {
-      const extracted = await processPOSReportImage(selectedFile);
-      setOcrData(extracted);
-      
-      // Auto-save when OCR completes successfully
-      if (extracted.totalSales || extracted.cash || extracted.card) {
-        onUpload(selectedFile, extracted);
-        // Reset after successful save
-        setTimeout(() => {
-          setFile(null);
-          setOcrData(null);
-          if (e.target) e.target.value = '';
-        }, 1000);
+      let extracted: { totalSales?: number; cash?: number; card?: number };
+
+      if (isPOSSpreadsheetFile(selectedFile)) {
+        const name = selectedFile.name.toLowerCase();
+        if (name.endsWith('.csv')) {
+          const text = await selectedFile.text();
+          extracted = parseCSVForPOS(text);
+        } else {
+          const buffer = await selectedFile.arrayBuffer();
+          extracted = await parseExcelForPOS(buffer);
+        }
+        if (!extracted.totalSales && !extracted.cash && !extracted.card) {
+          setError('Could not find Grocery Total, Cash, or Card columns. Use headers: total (or grocery total), cash, card.');
+          setProcessing(false);
+          return;
+        }
+      } else if (isPDFFile(selectedFile)) {
+        const buffer = await selectedFile.arrayBuffer();
+        const text = await extractTextFromPDF(buffer);
+        extracted = parsePOSReport(text);
+        if (!extracted.totalSales && !extracted.cash && !extracted.card) {
+          setError('Could not extract Total, Cash, or Card from PDF. Ensure the receipt contains those labels and amounts.');
+          setProcessing(false);
+          return;
+        }
       } else {
-        setError('Could not extract values from image. Please try again or check image quality.');
+        extracted = await processPOSReportImage(selectedFile);
+        if (!extracted.totalSales && !extracted.cash && !extracted.card) {
+          setError('Could not extract values from image. Please try again or check image quality.');
+          setProcessing(false);
+          return;
+        }
       }
+
+      setOcrData(extracted);
+      await onUpload(selectedFile, extracted);
+      setTimeout(() => {
+        setFile(null);
+        setOcrData(null);
+        if (e.target) e.target.value = '';
+      }, 1000);
     } catch (err: any) {
-      setError(err.message || 'Failed to process image. Please try again.');
+      setError(err.message || 'Failed to process file. Please try again.');
     } finally {
       setProcessing(false);
     }
@@ -2319,14 +2951,18 @@ function POSReportUpload({
       <div className="space-y-2">
         <Input
           type="file"
-          accept="image/*"
+          accept="image/*,.csv,.xlsx,.xls,.pdf"
           onChange={handleFileChange}
           disabled={disabled || processing}
           className="cursor-pointer"
         />
+        <p className="text-xs text-muted-foreground">
+          Upload image (OCR), PDF, CSV, or Excel (.xlsx, .xls). CSV/Excel: headers Total, Cash, Card. PDF/image: text with Total, Cash, Card.
+        </p>
         {processing && (
           <div className="text-sm text-muted-foreground flex items-center gap-2">
-            <span className="animate-pulse">⏳</span> Processing image and extracting values...
+            <span className="animate-pulse">⏳</span>
+            {file?.type.startsWith('image/') ? 'Processing image and extracting values...' : file?.type === 'application/pdf' ? 'Extracting text from PDF...' : 'Parsing file...'}
           </div>
         )}
         {error && (
@@ -2341,19 +2977,19 @@ function POSReportUpload({
               <div>
                 <span className="text-muted-foreground">Grocery Total:</span>
                 <div className="font-semibold">
-                  {ocrData.totalSales ? formatCurrency(ocrData.totalSales) : '—'}
+                  {ocrData.totalSales != null ? formatCurrency(ocrData.totalSales) : '—'}
                 </div>
               </div>
               <div>
                 <span className="text-muted-foreground">Cash:</span>
                 <div className="font-semibold">
-                  {ocrData.cash ? formatCurrency(ocrData.cash) : '—'}
+                  {ocrData.cash != null ? formatCurrency(ocrData.cash) : '—'}
                 </div>
               </div>
               <div>
                 <span className="text-muted-foreground">Card:</span>
                 <div className="font-semibold">
-                  {ocrData.card ? formatCurrency(ocrData.card) : '—'}
+                  {ocrData.card != null ? formatCurrency(ocrData.card) : '—'}
                 </div>
               </div>
             </div>

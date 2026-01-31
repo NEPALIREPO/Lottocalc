@@ -69,3 +69,53 @@ export async function createActivatedBook(
   revalidatePath('/admin/dashboard');
   return data;
 }
+
+export async function updateActivatedBook(
+  id: string,
+  updates: {
+    boxId?: string;
+    activatedDate?: string;
+    startTicketNumber?: number;
+    ticketCount?: number;
+    note?: string | null;
+  }
+) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('Unauthorized');
+
+  const body: Record<string, unknown> = {};
+  if (updates.boxId !== undefined) body.box_id = updates.boxId;
+  if (updates.activatedDate !== undefined) body.activated_date = updates.activatedDate;
+  if (updates.startTicketNumber !== undefined) body.start_ticket_number = updates.startTicketNumber;
+  if (updates.ticketCount !== undefined) body.ticket_count = updates.ticketCount;
+  if (updates.note !== undefined) body.note = updates.note;
+
+  if (Object.keys(body).length === 0) return null;
+
+  const { data, error } = await supabase
+    .from('activated_books')
+    .update(body)
+    .eq('id', id)
+    .select(`
+      *,
+      boxes (box_number, name, ticket_value)
+    `)
+    .single();
+
+  if (error) throw toSupabaseError(error);
+  revalidatePath('/staff/dashboard');
+  revalidatePath('/admin/dashboard');
+  return data;
+}
+
+export async function deleteActivatedBook(id: string) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('Unauthorized');
+
+  const { error } = await supabase.from('activated_books').delete().eq('id', id);
+  if (error) throw toSupabaseError(error);
+  revalidatePath('/staff/dashboard');
+  revalidatePath('/admin/dashboard');
+}

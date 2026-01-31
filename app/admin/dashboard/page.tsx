@@ -1,15 +1,17 @@
 import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
 import AdminDashboardClient from './client';
+import type { Entry } from '@/lib/types/dashboard';
 import { calculateDailySummary } from '@/lib/calculations';
 import { getMismatchCountToday } from '@/lib/actions/continuity';
 import { getPlayerBalances } from '@/lib/actions/players';
 import { getLotteryReports } from '@/lib/actions/lottery-reports';
-import { getPOSReport } from '@/lib/actions/pos-reports';
 import { getBoxes } from '@/lib/actions/boxes';
 import { getDailyBoxEntries } from '@/lib/actions/daily-entries';
 import { getActivatedBooksForDate } from '@/lib/actions/activated-books';
 import { getPlayers, getPlayerDailyActivities } from '@/lib/actions/players';
+
+export const dynamic = 'force-dynamic';
 
 export default async function AdminDashboardPage() {
   try {
@@ -52,7 +54,6 @@ export default async function AdminDashboardPage() {
     let playerBalances: Array<{ playerId: string; name: string; balance: number }> = [];
     let playerDailyActivities: Awaited<ReturnType<typeof getPlayerDailyActivities>> = [];
     let lotteryReports: Awaited<ReturnType<typeof getLotteryReports>> = [];
-    let posReport: Awaited<ReturnType<typeof getPOSReport>> | null = null;
     let boxes: Awaited<ReturnType<typeof getBoxes>>;
     let entries: Awaited<ReturnType<typeof getDailyBoxEntries>> = [];
     let activatedBooksForToday: Awaited<ReturnType<typeof getActivatedBooksForDate>> = [];
@@ -103,13 +104,6 @@ export default async function AdminDashboardPage() {
       lotteryReports = [];
     }
 
-    try {
-      posReport = await getPOSReport(todayStr);
-    } catch (error) {
-      console.error('Error getting POS report:', error);
-      posReport = null;
-    }
-    
     // Entry data
     try {
       boxes = await getBoxes();
@@ -148,23 +142,36 @@ export default async function AdminDashboardPage() {
       .filter((p) => p.balance < 0)
       .reduce((sum, p) => sum + Math.abs(p.balance), 0);
 
+    // Ensure props are serializable for Server Component → Client (no Date/undefined)
+    const serialized = {
+      summary,
+      mismatchCount,
+      lotteryDue,
+      outstandingCredit,
+      playerBalances,
+      playerDailyActivities,
+      boxes: JSON.parse(JSON.stringify(boxes ?? [])) as typeof boxes,
+      entries: JSON.parse(JSON.stringify(entries ?? [])) as Entry[],
+      activatedBooksForDate: JSON.parse(JSON.stringify(activatedBooksForToday ?? [])),
+      players: JSON.parse(JSON.stringify(players ?? [])),
+    };
+
     return (
       <AdminDashboardClient
-        summary={summary}
-        mismatchCount={mismatchCount}
-        lotteryDue={lotteryDue}
-        outstandingCredit={outstandingCredit}
-        playerBalances={playerBalances}
-        playerDailyActivities={playerDailyActivities}
-        boxes={boxes}
-        entries={entries}
-        activatedBooksForDate={activatedBooksForToday}
-        players={players}
+        summary={serialized.summary}
+        mismatchCount={serialized.mismatchCount}
+        lotteryDue={serialized.lotteryDue}
+        outstandingCredit={serialized.outstandingCredit}
+        playerBalances={serialized.playerBalances}
+        playerDailyActivities={serialized.playerDailyActivities}
+        boxes={serialized.boxes}
+        entries={serialized.entries}
+        activatedBooksForDate={serialized.activatedBooksForDate}
+        players={serialized.players}
       />
     );
   } catch (error) {
     console.error('AdminDashboardPage error:', error);
-    // Re-throw to trigger error.tsx
-    throw error;
+    redirect('/login');
   }
 }

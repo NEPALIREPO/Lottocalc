@@ -24,7 +24,6 @@ export async function updateSession(request: NextRequest) {
             return request.cookies.getAll();
           },
           setAll(cookiesToSet) {
-            cookiesToSet.forEach(({ name, value, options }) => request.cookies.set(name, value));
             supabaseResponse = NextResponse.next({
               request,
             });
@@ -41,7 +40,22 @@ export async function updateSession(request: NextRequest) {
       error: authError,
     } = await supabase.auth.getUser();
 
-    // If auth fails, allow request to proceed (will be handled by page-level auth)
+    // Invalid/expired refresh token → clear session and redirect to login
+    const isInvalidRefreshToken =
+      authError?.message?.includes('Refresh Token') ||
+      authError?.message?.includes('refresh_token') ||
+      (authError as { name?: string })?.name === 'AuthApiError';
+    if (authError && isInvalidRefreshToken) {
+      const loginUrl = new URL('/login', request.url);
+      const response = NextResponse.redirect(loginUrl);
+      request.cookies.getAll().forEach(({ name }) => {
+        if (name.startsWith('sb-') && name.includes('auth')) {
+          response.cookies.set(name, '', { maxAge: 0, path: '/' });
+        }
+      });
+      return response;
+    }
+
     if (authError) {
       console.error('Proxy auth error:', authError);
       return supabaseResponse;
